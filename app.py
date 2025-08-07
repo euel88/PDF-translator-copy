@@ -14,20 +14,41 @@ from datetime import datetime
 import logging
 import subprocess
 import shutil
+from typing import Optional, List, Dict
+import json
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # pdf2zh import 시도
+PDF2ZH_AVAILABLE = False
+PDF2ZH_CLI_AVAILABLE = False
+
 try:
+    # pdf2zh 모듈 import
     import pdf2zh
-    from pdf2zh import translate_stream
+    from pdf2zh import translate
     PDF2ZH_AVAILABLE = True
     logger.info("✅ pdf2zh 모듈 로드 성공")
 except ImportError as e:
-    PDF2ZH_AVAILABLE = False
     logger.error(f"❌ pdf2zh 모듈 로드 실패: {e}")
+
+# pdf2zh CLI 경로 찾기
+PDF2ZH_CMD = None
+for cmd in ['pdf2zh', '/home/adminuser/venv/bin/pdf2zh', '/usr/local/bin/pdf2zh']:
+    try:
+        result = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            PDF2ZH_CMD = cmd
+            PDF2ZH_CLI_AVAILABLE = True
+            logger.info(f"✅ pdf2zh CLI 사용 가능: {cmd}")
+            break
+    except:
+        continue
+
+if not PDF2ZH_CLI_AVAILABLE:
+    logger.warning("⚠️ pdf2zh CLI를 찾을 수 없음")
 
 # Python 버전 확인
 python_version = sys.version_info
@@ -100,7 +121,8 @@ if 'translation_history' not in st.session_state:
 def check_dependencies():
     """필수 패키지 확인"""
     dependencies = {
-        'pdf2zh': PDF2ZH_AVAILABLE,
+        'pdf2zh (Module)': PDF2ZH_AVAILABLE,
+        'pdf2zh (CLI)': PDF2ZH_CLI_AVAILABLE,
         'PyPDF2': False,
         'openai': False,
         'pymupdf': False
@@ -154,18 +176,71 @@ def estimate_cost(pages: int, model: str) -> dict:
     
     return {"tokens": total_tokens, "cost_usd": 0, "cost_krw": 0}
 
-def translate_with_pdf2zh(
+def translate_with_pdf2zh_api(
+    input_file: str,
+    output_dir: str,
+    service: str,
+    lang_from: str,
+    lang_to: str,
+    pages: Optional[List[int]] = None,
+    envs: Optional[Dict] = None,
+    thread: int = 2
+):
+    """pdf2zh Python API를 사용한 번역"""
+    try:
+        if not PDF2ZH_AVAILABLE:
+            return False, None, None, "pdf2zh 모듈을 사용할 수 없습니다"
+        
+        # 환경 변수 설정
+        if envs:
+            for key, value in envs.items():
+                os.environ[key] = value
+        
+        # pdf2zh.translate 함수 호출
+        from pdf2zh import translate
+        
+        logger.info(f"PDF 번역 시작: {input_file}")
+        logger.info(f"설정: service={service}, lang={lang_from}->{lang_to}, pages={pages}")
+        
+        # translate 함수 호출
+        result = translate(
+            files=[input_file],
+            output=output_dir,
+            pages=pages,
+            lang_in=lang_from,
+            lang_out=lang_to,
+            service=service,
+            thread=thread
+        )
+        
+        # 출력 파일 확인
+        base_name = Path(input_file).stem
+        mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
+        dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
+        
+        if mono_file.exists() and dual_file.exists():
+            return True, str(mono_file), str(dual_file), "번역 완료"
+        else:
+            return False, None, None, "번역 파일 생성 실패"
+            
+    except Exception as e:
+        logger.error(f"pdf2zh API 오류: {e}")
+        return False, None, None, str(e)
+
+def translate_with_pdf2zh_cli(
     input_file: str,
     output_dir: str,
     service: str,
     lang_from: str,
     lang_to: str,
     pages: str = None,
-    envs: dict = None,
-    progress_callback = None
+    envs: dict = None
 ):
-    """pdf2zh를 사용한 번역"""
+    """pdf2zh CLI를 사용한 번역 (폴백)"""
     try:
+        if not PDF2ZH_CLI_AVAILABLE or not PDF2ZH_CMD:
+            return False, None, None, "pdf2zh CLI를 사용할 수 없습니다"
+        
         # 환경 변수 설정
         env = os.environ.copy()
         if envs:
@@ -173,7 +248,7 @@ def translate_with_pdf2zh(
         
         # 명령어 구성
         cmd = [
-            sys.executable, "-m", "pdf2zh",
+            PDF2ZH_CMD,  # pdf2zh 실행 파일 경로
             input_file,
             "-o", output_dir,
             "-s", service,
@@ -196,6 +271,12 @@ def translate_with_pdf2zh(
             env=env
         )
         
+        logger.info(f"명령 실행 결과: returncode={result.returncode}")
+        if result.stdout:
+            logger.info(f"stdout: {result.stdout[:500]}")
+        if result.stderr:
+            logger.warning(f"stderr: {result.stderr[:500]}")
+        
         if result.returncode == 0:
             # 출력 파일 찾기
             base_name = Path(input_file).stem
@@ -205,7 +286,14 @@ def translate_with_pdf2zh(
             if mono_file.exists() and dual_file.exists():
                 return True, str(mono_file), str(dual_file), "번역 완료"
             else:
-                return False, None, None, "번역 파일 생성 실패"
+                # 파일명 패턴이 다를 수 있으므로 glob으로 찾기
+                mono_files = list(Path(output_dir).glob("*-mono.pdf"))
+                dual_files = list(Path(output_dir).glob("*-dual.pdf"))
+                
+                if mono_files and dual_files:
+                    return True, str(mono_files[0]), str(dual_files[0]), "번역 완료"
+                else:
+                    return False, None, None, "번역 파일을 찾을 수 없습니다"
         else:
             error_msg = result.stderr if result.stderr else result.stdout
             return False, None, None, f"번역 실패: {error_msg}"
@@ -213,17 +301,17 @@ def translate_with_pdf2zh(
     except subprocess.TimeoutExpired:
         return False, None, None, "번역 시간 초과 (10분)"
     except Exception as e:
-        logger.error(f"pdf2zh 번역 오류: {e}")
+        logger.error(f"pdf2zh CLI 오류: {e}")
         return False, None, None, str(e)
 
 def main():
     """메인 애플리케이션"""
     
     # pdf2zh 체크
-    if not PDF2ZH_AVAILABLE:
+    if not PDF2ZH_AVAILABLE and not PDF2ZH_CLI_AVAILABLE:
         st.markdown("""
         <div class="error-box">
-        ❌ <b>pdf2zh 모듈을 찾을 수 없습니다</b><br>
+        ❌ <b>pdf2zh를 사용할 수 없습니다</b><br>
         PDF 번역을 위해 pdf2zh가 필요합니다. 설치를 확인해주세요.
         </div>
         """, unsafe_allow_html=True)
@@ -232,29 +320,29 @@ def main():
         
         with st.expander("🔧 문제 해결 방법"):
             st.markdown("""
-            ### Streamlit Cloud에서 설치 실패 시:
+            ### 디버깅 정보:
+            - Python 경로: `{}`
+            - pdf2zh 모듈: {}
+            - pdf2zh CLI: {}
+            - PATH: {}
             
+            ### 해결 방법:
             1. **requirements.txt 확인**
                ```
                pdf2zh>=1.9.0
                ```
             
-            2. **packages.txt 확인** (시스템 패키지)
-               ```
-               libgl1
-               libglib2.0-0
-               ```
-            
-            3. **Python 버전 확인**
-               - Python 3.10-3.12 권장
-               - runtime.txt: `python-3.11`
-            
-            4. **로컬 테스트**
+            2. **로컬 테스트**
                ```bash
                pip install pdf2zh
                pdf2zh --version
                ```
-            """)
+            """.format(
+                sys.executable,
+                "✅ 사용 가능" if PDF2ZH_AVAILABLE else "❌ 사용 불가",
+                "✅ 사용 가능" if PDF2ZH_CLI_AVAILABLE else "❌ 사용 불가",
+                os.environ.get('PATH', '')[:200]
+            ))
         
         st.stop()
     
@@ -269,15 +357,21 @@ def main():
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         deps = check_dependencies()
-        if all(deps.values()):
-            st.success("✅ 모든 모듈 정상 로드")
-        else:
-            missing = [k for k, v in deps.items() if not v]
-            st.warning(f"⚠️ 누락된 모듈: {', '.join(missing)}")
+        working_deps = [k for k, v in deps.items() if v]
+        if working_deps:
+            st.success(f"✅ 사용 가능: {', '.join(working_deps)}")
+        missing = [k for k, v in deps.items() if not v]
+        if missing:
+            st.warning(f"⚠️ 사용 불가: {', '.join(missing)}")
     with col2:
         st.metric("번역 문서", len(st.session_state.translation_history), "📚")
     with col3:
-        st.metric("pdf2zh", "✅ 활성" if PDF2ZH_AVAILABLE else "❌ 비활성", "🔧")
+        if PDF2ZH_AVAILABLE:
+            st.metric("pdf2zh", "API ✅", "🔧")
+        elif PDF2ZH_CLI_AVAILABLE:
+            st.metric("pdf2zh", "CLI ✅", "🔧")
+        else:
+            st.metric("pdf2zh", "❌", "🔧")
     
     # 사이드바 설정
     with st.sidebar:
@@ -379,11 +473,10 @@ def main():
                 help="비워두면 전체 번역"
             )
             
-            file_type = st.radio(
-                "출력 형식",
-                ["dual", "mono"],
-                format_func=lambda x: "원본+번역" if x == "dual" else "번역만",
-                index=0
+            use_api = st.checkbox(
+                "Python API 사용",
+                value=PDF2ZH_AVAILABLE,
+                help="체크 해제 시 CLI 사용"
             )
     
     # 메인 영역
@@ -438,12 +531,13 @@ def main():
                 st.markdown("### 🎯 번역 실행")
                 
                 # 설정 요약
+                method = "API" if use_api and PDF2ZH_AVAILABLE else "CLI"
                 st.markdown(f"""
                 <div class="info-box">
                 <b>설정 확인</b><br>
                 • 엔진: {service.upper()}<br>
                 • 언어: {source_lang} → {target_lang}<br>
-                • 형식: {file_type}<br>
+                • 방식: {method}<br>
                 • 페이지: {pages if pages else '전체'}
                 </div>
                 """, unsafe_allow_html=True)
@@ -473,25 +567,53 @@ def main():
                     
                     output_dir = tempfile.mkdtemp()
                     
-                    # 진행률 콜백
-                    def update_progress(progress, msg="번역 중..."):
-                        progress_bar.progress(progress)
-                        status_text.text(msg)
+                    # 진행 상태 업데이트
+                    progress_bar.progress(0.2)
+                    status_text.text("📚 PDF 분석 중...")
+                    
+                    # 페이지 범위 파싱
+                    pages_list = None
+                    if pages:
+                        try:
+                            pages_list = []
+                            for p in pages.split(','):
+                                p = p.strip()
+                                if '-' in p:
+                                    start, end = p.split('-')
+                                    pages_list.extend(range(int(start)-1, int(end)))
+                                else:
+                                    pages_list.append(int(p)-1)
+                        except:
+                            st.error("잘못된 페이지 범위입니다")
                     
                     # 번역 실행
                     start_time = time.time()
-                    update_progress(0.1, "📚 PDF 분석 중...")
+                    progress_bar.progress(0.5)
+                    status_text.text("🔄 번역 중... (시간이 걸릴 수 있습니다)")
                     
-                    success, mono_file, dual_file, message = translate_with_pdf2zh(
-                        input_path,
-                        output_dir,
-                        service,
-                        lang_map[source_lang],
-                        lang_map[target_lang],
-                        pages,
-                        envs,
-                        update_progress
-                    )
+                    # API 또는 CLI 선택
+                    if use_api and PDF2ZH_AVAILABLE:
+                        logger.info("Python API 방식으로 번역 시작")
+                        success, mono_file, dual_file, message = translate_with_pdf2zh_api(
+                            input_path,
+                            output_dir,
+                            service,
+                            lang_map[source_lang],
+                            lang_map[target_lang],
+                            pages_list,
+                            envs
+                        )
+                    else:
+                        logger.info("CLI 방식으로 번역 시작")
+                        success, mono_file, dual_file, message = translate_with_pdf2zh_cli(
+                            input_path,
+                            output_dir,
+                            service,
+                            lang_map[source_lang],
+                            lang_map[target_lang],
+                            pages,
+                            envs
+                        )
                     
                     elapsed = time.time() - start_time
                     
@@ -547,13 +669,13 @@ def main():
                         # 임시 파일 정리
                         try:
                             os.unlink(input_path)
-                            if mono_file:
+                            if mono_file and os.path.exists(mono_file):
                                 os.unlink(mono_file)
-                            if dual_file:
+                            if dual_file and os.path.exists(dual_file):
                                 os.unlink(dual_file)
-                            shutil.rmtree(output_dir)
-                        except:
-                            pass
+                            shutil.rmtree(output_dir, ignore_errors=True)
+                        except Exception as e:
+                            logger.warning(f"임시 파일 정리 실패: {e}")
                     else:
                         st.error("❌ 번역 실패")
                         st.markdown(f"""
@@ -566,8 +688,12 @@ def main():
                         with st.expander("🔍 디버깅 정보"):
                             st.code(message)
                             st.write("**Python:**", sys.version)
-                            st.write("**pdf2zh:**", PDF2ZH_AVAILABLE)
+                            st.write("**pdf2zh Module:**", PDF2ZH_AVAILABLE)
+                            st.write("**pdf2zh CLI:**", PDF2ZH_CLI_AVAILABLE)
+                            st.write("**pdf2zh CMD:**", PDF2ZH_CMD)
                             st.write("**작업 디렉토리:**", os.getcwd())
+                            st.write("**임시 파일:**", input_path)
+                            st.write("**출력 디렉토리:**", output_dir)
     
     with tab2:
         st.markdown("""
@@ -604,6 +730,16 @@ def main():
         - 스캔된 이미지 PDF는 지원하지 않음
         - 매우 큰 파일(>50MB)은 시간이 오래 걸림
         - Streamlit Cloud는 실행 시간 제한 있음
+        
+        #### 🔧 문제 해결
+        
+        **"No module named pdf2zh.__main__" 오류**
+        - 정상입니다. CLI 방식으로 자동 전환됩니다.
+        
+        **번역이 안 될 때**
+        1. Google 번역으로 먼저 테스트
+        2. 페이지 범위를 작게 설정 (예: 1-5)
+        3. 다른 PDF 파일로 테스트
         """)
     
     with tab3:
@@ -636,6 +772,9 @@ def main():
         
         #### 📝 라이선스
         AGPL-3.0 License
+        
+        #### 🙏 감사의 말
+        이 프로젝트는 오픈소스 커뮤니티의 기여로 만들어졌습니다.
         """)
 
 if __name__ == "__main__":
