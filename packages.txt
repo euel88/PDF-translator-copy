@@ -1,4 +1,3 @@
-# 필수 시스템 패키지만 포함
 libgl1
 libglib2.0-0
 libsm6
