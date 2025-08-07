@@ -1,11 +1,5 @@
-# Streamlit Cloud 시스템 패키지
-# PDF 및 이미지 처리에 필요한 라이브러리
-
-# === 기본 라이브러리 ===
 build-essential
 python3-dev
-
-# === GUI/그래픽 라이브러리 ===
 libglib2.0-0
 libsm6
 libxext6
@@ -13,37 +7,25 @@ libxrender1
 libxrender-dev
 libgomp1
 libglib2.0-dev
-
-# === OpenGL 관련 (ONNX/OpenCV) ===
 libgl1
 libgl1-mesa-glx
 libglib2.0-0
-
-# === 이미지 처리 ===
-libpng-dev
-libjpeg-dev
-libtiff-dev
-libwebp-dev
-
-# === PDF 처리 (MuPDF 관련) ===
-libmupdf-dev
-mupdf-tools
-libfreetype6-dev
-libharfbuzz-dev
-
-# === 폰트 관련 ===
-fonts-noto-cjk
-fonts-liberation
-
-# === OpenCV 의존성 ===
 libopencv-dev
 python3-opencv
 ffmpeg
 libavcodec-dev
 libavformat-dev
 libswscale-dev
-
-# === 추가 유틸리티 ===
+libpng-dev
+libjpeg-dev
+libtiff-dev
+libwebp-dev
+libmupdf-dev
+mupdf-tools
+libfreetype6-dev
+libharfbuzz-dev
+fonts-noto-cjk
+fonts-liberation
 wget
 curl
 git
