@@ -1,0 +1,11 @@
+# 핵심 패키지
+streamlit>=1.28.0
+pdf2zh>=1.9.0
+PyPDF2>=3.0.0
+
+# OpenAI 연동
+openai>=1.0.0  # OpenAI Python 클라이언트
+
+# 선택 패키지 (필요시 주석 해제)
+# python-dotenv>=1.0.0  # .env 파일 자동 로드
+# tiktoken>=0.5.0  # 토큰 카운팅
