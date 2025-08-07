@@ -60,13 +60,34 @@ os.environ["HF_HOME"] = str(Path.home() / ".cache" / "huggingface")
 # pdf2zh import 시도
 PDF2ZH_AVAILABLE = False
 PDF2ZH_CLI_AVAILABLE = False
+MODEL_INSTANCE = None
 
 try:
     # pdf2zh 모듈 import
     import pdf2zh
     from pdf2zh import translate
+    from pdf2zh.doclayout import ModelInstance, OnnxModel
     PDF2ZH_AVAILABLE = True
     logger.info("✅ pdf2zh 모듈 로드 성공")
+    
+    # ONNX 모델 초기화 - 이 부분이 중요!
+    try:
+        logger.info("ONNX 모델 로드 중...")
+        ModelInstance.value = OnnxModel.from_pretrained()
+        MODEL_INSTANCE = ModelInstance.value
+        logger.info("✅ ONNX 모델 로드 성공")
+    except Exception as e:
+        logger.error(f"❌ ONNX 모델 로드 실패: {e}")
+        # 모델 로드 실패 시 대체 경로 시도
+        try:
+            logger.info("대체 모델 로드 시도...")
+            from pdf2zh.doclayout import DocLayoutModel
+            ModelInstance.value = DocLayoutModel.load_available()
+            MODEL_INSTANCE = ModelInstance.value
+            logger.info("✅ 대체 모델 로드 성공")
+        except Exception as e2:
+            logger.error(f"❌ 대체 모델도 로드 실패: {e2}")
+            
 except ImportError as e:
     logger.error(f"❌ pdf2zh 모듈 로드 실패: {e}")
 
@@ -168,6 +189,7 @@ def check_dependencies():
     dependencies = {
         'pdf2zh (Module)': PDF2ZH_AVAILABLE,
         'pdf2zh (CLI)': PDF2ZH_CLI_AVAILABLE,
+        'ONNX Model': MODEL_INSTANCE is not None,
         'Font': FONT_PATH is not None,
         'openai': False,
     }
@@ -235,6 +257,9 @@ def translate_with_pdf2zh_api(
         if not PDF2ZH_AVAILABLE:
             return False, None, None, "pdf2zh 모듈을 사용할 수 없습니다"
         
+        if MODEL_INSTANCE is None:
+            return False, None, None, "ONNX 모델이 로드되지 않았습니다"
+        
         # 환경 변수 설정
         if envs:
             for key, value in envs.items():
@@ -251,8 +276,9 @@ def translate_with_pdf2zh_api(
         logger.info(f"설정: service={service}, lang={lang_from}->{lang_to}, pages={pages}")
         logger.info(f"폰트 경로: {os.environ.get('NOTO_FONT_PATH')}")
         logger.info(f"폰트 서브셋 건너뛰기: {skip_fonts}")
+        logger.info(f"ONNX 모델: {MODEL_INSTANCE}")
         
-        # translate 함수 호출 (skip_subset_fonts 추가)
+        # translate 함수 호출 (model 파라미터 추가!)
         result = translate(
             files=[input_file],
             output=output_dir,
@@ -261,7 +287,8 @@ def translate_with_pdf2zh_api(
             lang_out=lang_to,
             service=service,
             thread=thread,
-            skip_subset_fonts=skip_fonts  # 폰트 서브셋팅 비활성화
+            skip_subset_fonts=skip_fonts,
+            model=MODEL_INSTANCE  # 모델 파라미터 추가
         )
         
         # 출력 파일 확인
@@ -275,7 +302,7 @@ def translate_with_pdf2zh_api(
             return False, None, None, "번역 파일 생성 실패"
             
     except Exception as e:
-        logger.error(f"pdf2zh API 오류: {e}")
+        logger.error(f"pdf2zh API 오류: {e}", exc_info=True)
         return False, None, None, str(e)
 
 def translate_with_pdf2zh_cli(
@@ -384,10 +411,32 @@ def main():
             - Python 경로: `{sys.executable}`
             - pdf2zh 모듈: {'✅ 사용 가능' if PDF2ZH_AVAILABLE else '❌ 사용 불가'}
             - pdf2zh CLI: {'✅ 사용 가능' if PDF2ZH_CLI_AVAILABLE else '❌ 사용 불가'}
+            - ONNX 모델: {'✅ 로드됨' if MODEL_INSTANCE else '❌ 로드 실패'}
             - 폰트 경로: {FONT_PATH or 'Not set'}
             """)
         
         st.stop()
+    
+    # ONNX 모델 체크
+    if PDF2ZH_AVAILABLE and MODEL_INSTANCE is None:
+        st.markdown("""
+        <div class="warning-box">
+        ⚠️ <b>ONNX 모델 로드 실패</b><br>
+        문서 레이아웃 분석을 위한 모델이 로드되지 않았습니다.<br>
+        모델 다운로드 중이거나 네트워크 문제일 수 있습니다.
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.expander("🔧 문제 해결 방법"):
+            st.markdown("""
+            ### 해결 방법:
+            1. 잠시 후 페이지를 새로고침하세요
+            2. 네트워크 연결을 확인하세요
+            3. HuggingFace 모델 다운로드가 차단되지 않았는지 확인하세요
+            
+            ### 대체 방법:
+            CLI 모드를 사용하면 모델이 자동으로 다운로드됩니다.
+            """)
     
     # 헤더
     st.markdown("""
@@ -409,7 +458,9 @@ def main():
     with col2:
         st.metric("번역 문서", len(st.session_state.translation_history), "📚")
     with col3:
-        if PDF2ZH_AVAILABLE:
+        if MODEL_INSTANCE:
+            st.metric("ONNX", "✅", "🤖")
+        elif PDF2ZH_AVAILABLE:
             st.metric("pdf2zh", "API ✅", "🔧")
         elif PDF2ZH_CLI_AVAILABLE:
             st.metric("pdf2zh", "CLI ✅", "🔧")
@@ -562,9 +613,13 @@ def main():
             
             use_api = st.checkbox(
                 "Python API 사용",
-                value=PDF2ZH_AVAILABLE,
-                help="체크 해제 시 CLI 사용"
+                value=PDF2ZH_AVAILABLE and MODEL_INSTANCE is not None,
+                help="체크 해제 시 CLI 사용",
+                disabled=MODEL_INSTANCE is None
             )
+            
+            if MODEL_INSTANCE is None and PDF2ZH_AVAILABLE:
+                st.warning("⚠️ ONNX 모델이 로드되지 않아 API 모드를 사용할 수 없습니다")
     
     # 메인 영역
     tab1, tab2, tab3 = st.tabs(["📤 번역하기", "📖 사용법", "ℹ️ 정보"])
@@ -639,7 +694,7 @@ def main():
                 st.markdown("### 🎯 번역 실행")
                 
                 # 설정 요약
-                method = "API" if use_api and PDF2ZH_AVAILABLE else "CLI"
+                method = "API" if use_api and PDF2ZH_AVAILABLE and MODEL_INSTANCE else "CLI"
                 st.markdown(f"""
                 <div class="info-box">
                 <b>설정 확인</b><br>
@@ -701,7 +756,7 @@ def main():
                     status_text.text("🔄 번역 중... (시간이 걸릴 수 있습니다)")
                     
                     # API 또는 CLI 선택
-                    if use_api and PDF2ZH_AVAILABLE:
+                    if use_api and PDF2ZH_AVAILABLE and MODEL_INSTANCE:
                         logger.info("Python API 방식으로 번역 시작")
                         success, mono_file, dual_file, message = translate_with_pdf2zh_api(
                             input_path,
@@ -802,6 +857,7 @@ def main():
                             st.write("**pdf2zh Module:**", PDF2ZH_AVAILABLE)
                             st.write("**pdf2zh CLI:**", PDF2ZH_CLI_AVAILABLE)
                             st.write("**pdf2zh CMD:**", PDF2ZH_CMD)
+                            st.write("**ONNX Model:**", "Loaded" if MODEL_INSTANCE else "Not loaded")
                             st.write("**작업 디렉토리:**", os.getcwd())
                             st.write("**임시 파일:**", input_path)
                             st.write("**출력 디렉토리:**", output_dir)
