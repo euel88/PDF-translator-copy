@@ -1,6 +1,6 @@
 """
-PDF Math Translator Pro - Streamlit Cloud 최적화 버전
-pdf2zh + OCR 전체 기능 포함 (메모리 최적화)
+PDF Math Translator Pro - Streamlit Cloud Stable Version
+Full features with memory optimization
 """
 
 import streamlit as st
@@ -12,25 +12,21 @@ import subprocess
 import logging
 from pathlib import Path
 import time
-import base64
 from datetime import datetime
 from typing import Optional, List, Dict
-import json
 import shutil
 import io
 
-# 메모리 모니터링
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except:
-    PSUTIL_AVAILABLE = False
+# Basic imports
+import requests
+import html
+import json
 
-# 로깅 설정
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 페이지 설정
+# Page configuration
 st.set_page_config(
     page_title="PDF Math Translator Pro",
     page_icon="📐",
@@ -38,7 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS 스타일
+# Custom CSS
 st.markdown("""
 <style>
     .main-header {
@@ -62,138 +58,71 @@ st.markdown("""
         border-radius: 8px;
         color: #991b1b;
     }
-    .warning-box {
-        background: #fef3c7;
-        border: 1px solid #f59e0b;
+    .info-box {
+        background: #e0e7ff;
+        border: 1px solid #6366f1;
         padding: 1rem;
         border-radius: 8px;
-        color: #92400e;
-    }
-    .memory-bar {
-        background: #f3f4f6;
-        border-radius: 5px;
-        height: 20px;
-        overflow: hidden;
-    }
-    .memory-fill {
-        background: linear-gradient(to right, #10b981, #059669);
-        height: 100%;
-        transition: width 0.3s;
+        color: #312e81;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# 세션 상태 초기화
+# Session state initialization
 if 'api_key' not in st.session_state:
     st.session_state.api_key = os.getenv("OPENAI_API_KEY", "")
 if 'ocr_enabled' not in st.session_state:
     st.session_state.ocr_enabled = False
-if 'dependencies_installed' not in st.session_state:
-    st.session_state.dependencies_installed = False
+if 'pdf2zh_available' not in st.session_state:
+    st.session_state.pdf2zh_available = False
 
-def get_memory_usage():
-    """메모리 사용량 확인"""
-    if PSUTIL_AVAILABLE:
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        return mem_info.rss / 1024 / 1024  # MB
-    return 0
-
-def clear_memory():
-    """메모리 정리"""
-    gc.collect()
-    if hasattr(gc, 'garbage'):
-        del gc.garbage[:]
-    logger.info(f"메모리 정리 완료: {get_memory_usage():.1f} MB 사용 중")
-
-@st.cache_resource
-def install_runtime_dependencies():
-    """런타임에 필요한 패키지 설치 (한 번만 실행)"""
-    if st.session_state.dependencies_installed:
-        return True
+def check_dependencies():
+    """Check available dependencies"""
+    deps = {
+        'streamlit': False,
+        'pdf2zh': False,
+        'PyPDF2': False,
+        'pymupdf': False,
+        'openai': False,
+        'PIL': False
+    }
     
-    with st.spinner("🔧 필수 구성 요소 설치 중... (첫 실행 시에만 필요)"):
+    for module in deps.keys():
         try:
-            # torch CPU 버전 설치 (가장 작은 크기)
-            if not check_package_installed('torch'):
-                st.info("PyTorch CPU 버전 설치 중...")
-                subprocess.check_call([
-                    sys.executable, '-m', 'pip', 'install', 
-                    'torch==2.0.1+cpu', 'torchvision==0.15.2+cpu',
-                    '-f', 'https://download.pytorch.org/whl/torch_stable.html',
-                    '--no-cache-dir'
-                ])
-                st.success("✅ PyTorch 설치 완료")
-            
-            # EasyOCR 설치
-            if not check_package_installed('easyocr'):
-                st.info("EasyOCR 설치 중...")
-                subprocess.check_call([
-                    sys.executable, '-m', 'pip', 'install',
-                    'easyocr', '--no-cache-dir'
-                ])
-                st.success("✅ EasyOCR 설치 완료")
-            
-            st.session_state.dependencies_installed = True
-            clear_memory()
-            return True
-            
-        except Exception as e:
-            st.error(f"설치 실패: {e}")
-            return False
+            if module == 'pymupdf':
+                __import__('fitz')
+            elif module == 'PIL':
+                __import__('PIL')
+            else:
+                __import__(module)
+            deps[module] = True
+        except ImportError:
+            deps[module] = False
+    
+    return deps
 
-def check_package_installed(package_name):
-    """패키지 설치 여부 확인"""
-    try:
-        __import__(package_name)
-        return True
-    except ImportError:
-        return False
-
-@st.cache_resource
 def initialize_pdf2zh():
-    """pdf2zh 초기화 (한 번만 실행)"""
+    """Initialize pdf2zh if available"""
     try:
-        # pdf2zh import
         import pdf2zh
         from pdf2zh import translate
         from pdf2zh.doclayout import ModelInstance, OnnxModel
         
-        # ONNX 모델 로드
-        with st.spinner("📚 레이아웃 분석 모델 로드 중..."):
-            if ModelInstance.value is None:
+        if ModelInstance.value is None:
+            with st.spinner("Loading layout detection model..."):
                 ModelInstance.value = OnnxModel.from_pretrained()
         
-        logger.info("✅ pdf2zh 초기화 완료")
-        return True, ModelInstance.value
+        st.session_state.pdf2zh_available = True
+        logger.info("pdf2zh initialized successfully")
+        return True
         
     except Exception as e:
-        logger.error(f"pdf2zh 초기화 실패: {e}")
-        return False, None
-
-@st.cache_resource
-def initialize_ocr_engine():
-    """OCR 엔진 초기화 (지연 로딩)"""
-    if not st.session_state.ocr_enabled:
-        return None
-    
-    try:
-        import easyocr
-        
-        with st.spinner("🔍 OCR 엔진 초기화 중..."):
-            # CPU 모드로 초기화 (GPU 사용 안 함)
-            reader = easyocr.Reader(['en', 'ko'], gpu=False)
-            logger.info("✅ OCR 엔진 초기화 완료")
-            clear_memory()
-            return reader
-            
-    except Exception as e:
-        logger.error(f"OCR 초기화 실패: {e}")
-        st.warning(f"OCR을 사용할 수 없습니다: {e}")
-        return None
+        logger.error(f"pdf2zh initialization failed: {e}")
+        st.session_state.pdf2zh_available = False
+        return False
 
 def download_fonts():
-    """필요한 폰트 다운로드"""
+    """Download required fonts"""
     font_dir = Path.home() / ".cache" / "pdf2zh" / "fonts"
     font_dir.mkdir(parents=True, exist_ok=True)
     
@@ -206,37 +135,100 @@ def download_fonts():
         font_path = font_dir / font_name
         if not font_path.exists():
             try:
-                import requests
                 response = requests.get(url, timeout=30)
                 if response.status_code == 200:
                     with open(font_path, 'wb') as f:
                         f.write(response.content)
-                    logger.info(f"폰트 다운로드: {font_name}")
+                    logger.info(f"Downloaded font: {font_name}")
             except Exception as e:
-                logger.error(f"폰트 다운로드 실패: {e}")
+                logger.error(f"Font download failed: {e}")
 
-class OptimizedPDFTranslator:
-    """메모리 최적화된 PDF 번역기"""
+class SimplePDFTranslator:
+    """Simple PDF translator with optional pdf2zh support"""
     
     def __init__(self, config):
         self.config = config
-        self.pdf2zh_available = False
-        self.model_instance = None
-        self.ocr_reader = None
+        self.use_pdf2zh = st.session_state.pdf2zh_available and config.get('use_pdf2zh', True)
     
-    def translate_with_pdf2zh(self, input_path, output_dir, pages=None, progress_callback=None):
-        """pdf2zh를 사용한 번역 (메모리 최적화)"""
+    def translate_text_openai(self, text: str) -> str:
+        """Translate using OpenAI API"""
+        if not self.config.get('api_key'):
+            return text
+        
+        try:
+            import openai
+            from openai import OpenAI
+            
+            client = OpenAI(api_key=self.config['api_key'])
+            
+            # Limit text length
+            max_chars = 3000
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            
+            response = client.chat.completions.create(
+                model=self.config.get('model', 'gpt-3.5-turbo'),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"Translate from {self.config['lang_from']} to {self.config['lang_to']}. Only return translation."
+                    },
+                    {"role": "user", "content": text}
+                ],
+                temperature=0,
+                max_tokens=2000
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"OpenAI translation error: {e}")
+            return text
+    
+    def translate_text_google(self, text: str) -> str:
+        """Translate using Google Translate"""
+        try:
+            # Limit text length
+            max_chars = 5000
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            
+            url = "https://translate.google.com/m"
+            params = {
+                'sl': self.config['lang_from'],
+                'tl': self.config['lang_to'],
+                'q': text
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                import re
+                result = re.findall(r'class="(?:t0|result-container)">(.*?)<', response.text)
+                if result:
+                    return html.unescape(result[0])
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Google translation error: {e}")
+            return text
+    
+    def translate_with_pdf2zh(self, input_path: str, output_dir: str, 
+                             pages: Optional[List[int]] = None) -> Dict:
+        """Translate using pdf2zh"""
         try:
             from pdf2zh import translate
+            from pdf2zh.doclayout import ModelInstance
             
-            # 환경 변수 설정
+            # Set environment variables
             envs = {}
             if self.config.get('api_key'):
                 if self.config['service'] == 'openai':
                     envs['OPENAI_API_KEY'] = self.config['api_key']
-                    envs['OPENAI_MODEL'] = self.config.get('model', 'gpt-4o-mini')
+                    envs['OPENAI_MODEL'] = self.config.get('model', 'gpt-3.5-turbo')
             
-            # pdf2zh 실행
+            # Run pdf2zh
             result = translate(
                 files=[input_path],
                 output=output_dir,
@@ -244,165 +236,165 @@ class OptimizedPDFTranslator:
                 lang_in=self.config['lang_from'],
                 lang_out=self.config['lang_to'],
                 service=self.config['service'],
-                thread=self.config.get('threads', 4),
-                model=self.model_instance,
+                thread=2,  # Limit threads
+                model=ModelInstance.value,
                 envs=envs,
                 skip_subset_fonts=True,
                 ignore_cache=False
             )
             
-            # 결과 파일 경로
+            # Get output files
             base_name = Path(input_path).stem
             mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
             dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
             
-            clear_memory()
-            return True, str(mono_file), str(dual_file), "번역 완료"
+            return {
+                'success': True,
+                'mono': str(mono_file),
+                'dual': str(dual_file)
+            }
             
         except Exception as e:
-            logger.error(f"pdf2zh 번역 오류: {e}")
-            return False, None, None, str(e)
+            logger.error(f"pdf2zh translation error: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
     
-    def enhance_with_ocr(self, pdf_path, ocr_reader):
-        """OCR로 이미지 텍스트 번역 추가 (메모리 최적화)"""
-        if not ocr_reader or not self.config.get('ocr_enabled'):
-            return pdf_path
-        
+    def translate_simple(self, input_path: str, output_dir: str,
+                        pages: Optional[List[int]] = None) -> Dict:
+        """Simple translation without pdf2zh"""
         try:
-            import fitz
-            from PIL import Image
-            import numpy as np
+            import fitz  # PyMuPDF
             
-            doc = fitz.open(pdf_path)
+            base_name = Path(input_path).stem
+            output_path = Path(output_dir) / f"{base_name}-translated.pdf"
             
-            # 페이지별 처리 (메모리 절약)
-            for page_num in range(len(doc)):
+            doc = fitz.open(input_path)
+            
+            # Process pages
+            if pages is None:
+                pages = list(range(len(doc)))
+            
+            for page_num in pages:
                 page = doc[page_num]
-                image_list = page.get_images()
                 
-                for img_index, img_info in enumerate(image_list):
-                    try:
-                        # 이미지 추출
-                        xref = img_info[0]
-                        pix = fitz.Pixmap(doc, xref)
-                        
-                        if pix.alpha:
-                            pix = fitz.Pixmap(pix, 0)
-                        
-                        # PIL 이미지로 변환
-                        img_data = pix.tobytes("png")
-                        image = Image.open(io.BytesIO(img_data))
-                        
-                        # numpy 배열로 변환
-                        img_array = np.array(image)
-                        
-                        # OCR 실행
-                        results = ocr_reader.readtext(img_array)
-                        
-                        if results:
-                            logger.info(f"페이지 {page_num}: {len(results)}개 텍스트 감지")
-                            # 여기에 번역 및 이미지 교체 로직 추가 가능
-                        
-                        # 메모리 해제
-                        pix = None
-                        del img_array
-                        image.close()
-                        
-                    except Exception as e:
-                        logger.error(f"이미지 처리 오류: {e}")
-                        continue
+                # Extract text blocks
+                blocks = page.get_text("blocks")
                 
-                # 각 페이지 처리 후 메모리 정리
-                if page_num % 5 == 0:
-                    clear_memory()
+                for block in blocks:
+                    if block[6] == 0:  # Text block
+                        original_text = block[4].strip()
+                        if original_text:
+                            # Translate
+                            if self.config['service'] == 'openai':
+                                translated = self.translate_text_openai(original_text)
+                            else:
+                                translated = self.translate_text_google(original_text)
+                            
+                            # Try to replace text (simplified)
+                            try:
+                                rect = fitz.Rect(block[:4])
+                                page.add_redact_annot(rect)
+                            except:
+                                pass
             
-            # 저장
-            output_path = pdf_path.replace('.pdf', '_ocr.pdf')
-            doc.save(output_path)
+            # Apply redactions
+            for page_num in pages:
+                try:
+                    doc[page_num].apply_redactions()
+                except:
+                    pass
+            
+            # Add translated text
+            for page_num in pages:
+                page = doc[page_num]
+                blocks = page.get_text("blocks")
+                
+                for block in blocks:
+                    if block[6] == 0:
+                        original_text = block[4].strip()
+                        if original_text:
+                            if self.config['service'] == 'openai':
+                                translated = self.translate_text_openai(original_text)
+                            else:
+                                translated = self.translate_text_google(original_text)
+                            
+                            try:
+                                rect = fitz.Rect(block[:4])
+                                page.insert_textbox(
+                                    rect,
+                                    translated,
+                                    fontsize=10,
+                                    align=fitz.TEXT_ALIGN_LEFT
+                                )
+                            except:
+                                pass
+            
+            # Save
+            doc.save(str(output_path), deflate=True, garbage=3)
             doc.close()
             
-            clear_memory()
-            return output_path
+            return {
+                'success': True,
+                'mono': str(output_path),
+                'dual': None
+            }
             
         except Exception as e:
-            logger.error(f"OCR 처리 오류: {e}")
-            return pdf_path
+            logger.error(f"Simple translation error: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
 def main():
-    # 헤더
+    # Header
     st.markdown("""
     <div class="main-header">
         <h1>📐 PDF Math Translator Pro</h1>
-        <p>수식과 레이아웃을 보존하는 과학 논문 번역 + 이미지 텍스트 번역</p>
-        <p>Powered by pdf2zh & OCR - Streamlit Cloud Optimized</p>
+        <p>Scientific Paper Translation with Layout Preservation</p>
+        <p>Powered by pdf2zh & OpenAI</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # 메모리 상태 표시
-    if PSUTIL_AVAILABLE:
-        mem_usage = get_memory_usage()
-        mem_percent = min(mem_usage / 1024 * 100, 100)  # 1GB 기준
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            st.markdown(f"""
-            <div class="memory-bar">
-                <div class="memory-fill" style="width: {mem_percent}%"></div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.caption(f"메모리 사용: {mem_usage:.1f} MB / 1024 MB")
-        with col2:
-            if st.button("🧹 메모리 정리"):
-                clear_memory()
+    # Check dependencies
+    deps = check_dependencies()
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        working = [k for k, v in deps.items() if v]
+        if working:
+            st.success(f"✅ Available: {', '.join(working)}")
+        missing = [k for k, v in deps.items() if not v]
+        if missing:
+            st.warning(f"⚠️ Missing: {', '.join(missing)}")
+    
+    with col2:
+        if st.button("🔄 Initialize pdf2zh"):
+            if initialize_pdf2zh():
+                st.success("✅ pdf2zh ready")
                 st.rerun()
-        with col3:
-            st.metric("상태", "정상" if mem_usage < 900 else "주의")
-    
-    # 의존성 설치 확인
-    if not st.session_state.dependencies_installed:
-        if st.button("🚀 시작하기 (필수 구성 요소 설치)"):
-            if install_runtime_dependencies():
-                st.success("✅ 설치 완료! 페이지를 새로고침하세요.")
-                st.balloons()
             else:
-                st.error("설치 실패. 페이지를 새로고침한 후 다시 시도하세요.")
-        st.stop()
+                st.error("❌ pdf2zh failed")
     
-    # pdf2zh 초기화
-    pdf2zh_available, model_instance = initialize_pdf2zh()
+    with col3:
+        st.metric("pdf2zh", "Ready" if st.session_state.pdf2zh_available else "Not ready")
     
-    # OCR 엔진 (지연 로딩)
-    ocr_reader = None
-    
-    # 사이드바 설정
+    # Sidebar
     with st.sidebar:
-        st.header("⚙️ 번역 설정")
+        st.header("⚙️ Settings")
         
-        # OCR 설정
-        st.subheader("🔍 OCR 설정")
-        ocr_enabled = st.checkbox(
-            "이미지 텍스트 번역 활성화",
-            value=st.session_state.ocr_enabled,
-            help="PDF 내 이미지에 포함된 텍스트도 번역합니다"
-        )
-        st.session_state.ocr_enabled = ocr_enabled
-        
-        if ocr_enabled:
-            st.info("📸 이미지 내 텍스트를 감지하고 번역합니다")
-            # OCR 엔진 초기화 (처음 활성화 시)
-            if ocr_reader is None:
-                ocr_reader = initialize_ocr_engine()
-        
-        # 번역 서비스
-        st.subheader("🌐 번역 서비스")
+        # Translation service
+        st.subheader("🌐 Translation Service")
         service = st.selectbox(
-            "번역 엔진",
-            ["openai", "google"],
-            help="OpenAI GPT가 가장 정확합니다"
+            "Service",
+            ["google", "openai"],
+            help="Google is free, OpenAI needs API key"
         )
         
         api_key = ""
-        model = "gpt-4o-mini"
+        model = "gpt-3.5-turbo"
         
         if service == "openai":
             api_key = st.text_input(
@@ -414,89 +406,86 @@ def main():
             
             if api_key:
                 st.session_state.api_key = api_key
-                st.success("✅ API 키 설정됨")
+                st.success("✅ API key set")
             else:
-                st.warning("⚠️ API 키를 입력하세요")
+                st.warning("⚠️ API key required")
             
             model = st.selectbox(
-                "GPT 모델",
-                ["gpt-4o-mini", "gpt-3.5-turbo"],
-                help="gpt-4o-mini: 가성비 최고"
+                "Model",
+                ["gpt-3.5-turbo", "gpt-4o-mini"],
+                help="gpt-3.5-turbo is cheaper"
             )
         
-        # 언어 설정
-        st.subheader("🌍 언어 설정")
+        # Languages
+        st.subheader("🌍 Languages")
         lang_map = {
-            "영어": "en",
-            "한국어": "ko",
-            "중국어(간체)": "zh",
-            "일본어": "ja",
-            "스페인어": "es",
-            "프랑스어": "fr",
-            "독일어": "de"
+            "English": "en",
+            "Korean": "ko",
+            "Chinese (Simplified)": "zh",
+            "Japanese": "ja",
+            "Spanish": "es",
+            "French": "fr",
+            "German": "de"
         }
         
-        source_lang = st.selectbox("원본 언어", list(lang_map.keys()), index=0)
-        target_lang = st.selectbox("번역 언어", list(lang_map.keys()), index=1)
+        source_lang = st.selectbox("Source", list(lang_map.keys()), index=0)
+        target_lang = st.selectbox("Target", list(lang_map.keys()), index=1)
         
-        # 고급 옵션
-        with st.expander("🔧 고급 옵션"):
-            pages = st.text_input(
-                "페이지 범위",
-                placeholder="예: 1-10, 15",
-                help="비워두면 전체 번역"
+        # Options
+        with st.expander("🔧 Advanced"):
+            use_pdf2zh = st.checkbox(
+                "Use pdf2zh (if available)",
+                value=True,
+                help="Better layout preservation"
             )
             
-            threads = st.slider("병렬 처리", 1, 4, 2, help="메모리 사용량 증가")
+            pages_input = st.text_input(
+                "Pages",
+                placeholder="e.g., 1-10, 15",
+                help="Leave empty for all"
+            )
     
-    # 메인 영역
-    tab1, tab2, tab3 = st.tabs(["📤 번역하기", "📖 사용법", "ℹ️ 정보"])
+    # Main area
+    tab1, tab2 = st.tabs(["📤 Translate", "ℹ️ Info"])
     
     with tab1:
         uploaded_file = st.file_uploader(
-            "PDF 파일을 선택하세요",
+            "Choose PDF file",
             type=['pdf'],
-            help="수식과 이미지가 포함된 과학 논문에 최적화"
+            help="Works best with scientific papers"
         )
         
         if uploaded_file:
             col1, col2 = st.columns([2, 1])
             
             with col1:
-                st.success(f"✅ 파일 준비: **{uploaded_file.name}**")
-                
+                st.success(f"✅ File: {uploaded_file.name}")
                 file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
-                st.info(f"📁 파일 크기: {file_size:.1f} MB")
+                st.info(f"Size: {file_size:.1f} MB")
                 
                 if file_size > 10:
-                    st.warning("⚠️ 큰 파일은 처리 시간이 오래 걸릴 수 있습니다")
+                    st.warning("⚠️ Large files may take time")
             
             with col2:
-                st.markdown("### 🎯 번역 실행")
-                
-                # 설정 요약
-                st.markdown(f"""
-                - 엔진: {service.upper()}
-                - 언어: {source_lang} → {target_lang}
-                - OCR: {'✅' if ocr_enabled else '❌'}
-                - pdf2zh: {'✅' if pdf2zh_available else '❌'}
-                """)
-                
-                # 번역 버튼
+                # Translate button
                 can_translate = True
                 if service == "openai" and not api_key:
-                    st.error("API 키를 입력하세요")
+                    st.error("API key required")
                     can_translate = False
                 
-                if st.button("🚀 번역 시작", type="primary", disabled=not can_translate):
-                    # 진행률
+                if st.button("🚀 Start Translation", 
+                           type="primary", 
+                           disabled=not can_translate,
+                           use_container_width=True):
+                    
+                    # Progress
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    # 폰트 다운로드
+                    # Download fonts
                     download_fonts()
                     
-                    # 임시 파일 저장
+                    # Save uploaded file
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                         tmp.write(uploaded_file.getvalue())
                         input_path = tmp.name
@@ -504,29 +493,12 @@ def main():
                     output_dir = tempfile.mkdtemp()
                     
                     try:
-                        # 번역 설정
-                        config = {
-                            'service': service,
-                            'api_key': api_key,
-                            'model': model,
-                            'lang_from': lang_map[source_lang],
-                            'lang_to': lang_map[target_lang],
-                            'ocr_enabled': ocr_enabled,
-                            'threads': threads
-                        }
-                        
-                        # 번역기 초기화
-                        translator = OptimizedPDFTranslator(config)
-                        translator.pdf2zh_available = pdf2zh_available
-                        translator.model_instance = model_instance
-                        translator.ocr_reader = ocr_reader
-                        
-                        # 페이지 범위 파싱
+                        # Parse pages
                         pages_list = None
-                        if pages:
+                        if pages_input:
                             try:
                                 pages_list = []
-                                for p in pages.split(','):
+                                for p in pages_input.split(','):
                                     p = p.strip()
                                     if '-' in p:
                                         start, end = p.split('-')
@@ -534,66 +506,69 @@ def main():
                                     else:
                                         pages_list.append(int(p)-1)
                             except:
-                                st.error("잘못된 페이지 범위")
+                                st.error("Invalid page range")
                         
-                        # 번역 실행
-                        status_text.text("📚 PDF 분석 중...")
-                        progress_bar.progress(0.2)
+                        # Translation config
+                        config = {
+                            'service': service,
+                            'api_key': api_key,
+                            'model': model,
+                            'lang_from': lang_map[source_lang],
+                            'lang_to': lang_map[target_lang],
+                            'use_pdf2zh': use_pdf2zh and st.session_state.pdf2zh_available
+                        }
                         
-                        if pdf2zh_available:
-                            status_text.text("🔄 번역 중... (시간이 걸릴 수 있습니다)")
-                            progress_bar.progress(0.5)
-                            
-                            success, mono_file, dual_file, message = translator.translate_with_pdf2zh(
+                        # Create translator
+                        translator = SimplePDFTranslator(config)
+                        
+                        # Translate
+                        status_text.text("Translating...")
+                        progress_bar.progress(0.5)
+                        
+                        if config['use_pdf2zh']:
+                            result = translator.translate_with_pdf2zh(
                                 input_path, output_dir, pages_list
                             )
-                            
-                            if success and ocr_enabled and ocr_reader:
-                                status_text.text("🔍 이미지 텍스트 처리 중...")
-                                progress_bar.progress(0.8)
-                                mono_file = translator.enhance_with_ocr(mono_file, ocr_reader)
-                            
-                            progress_bar.progress(1.0)
-                            
-                            if success:
-                                st.balloons()
-                                status_text.text("✅ 번역 완료!")
-                                
-                                # 다운로드 버튼
-                                col_a, col_b = st.columns(2)
-                                
-                                with col_a:
-                                    if mono_file and os.path.exists(mono_file):
-                                        with open(mono_file, 'rb') as f:
-                                            st.download_button(
-                                                "📥 번역본 다운로드",
-                                                f.read(),
-                                                f"{uploaded_file.name.replace('.pdf', '')}_translated.pdf",
-                                                "application/pdf",
-                                                use_container_width=True
-                                            )
-                                
-                                with col_b:
-                                    if dual_file and os.path.exists(dual_file):
-                                        with open(dual_file, 'rb') as f:
-                                            st.download_button(
-                                                "📥 대조본 다운로드",
-                                                f.read(),
-                                                f"{uploaded_file.name.replace('.pdf', '')}_dual.pdf",
-                                                "application/pdf",
-                                                use_container_width=True
-                                            )
-                            else:
-                                st.error(f"❌ 번역 실패: {message}")
                         else:
-                            st.error("pdf2zh를 사용할 수 없습니다")
+                            result = translator.translate_simple(
+                                input_path, output_dir, pages_list
+                            )
                         
+                        progress_bar.progress(1.0)
+                        
+                        if result['success']:
+                            st.balloons()
+                            status_text.text("✅ Translation complete!")
+                            
+                            # Download buttons
+                            if result.get('mono') and os.path.exists(result['mono']):
+                                with open(result['mono'], 'rb') as f:
+                                    st.download_button(
+                                        "📥 Download Translated PDF",
+                                        f.read(),
+                                        f"{uploaded_file.name.replace('.pdf', '')}_translated.pdf",
+                                        "application/pdf",
+                                        use_container_width=True
+                                    )
+                            
+                            if result.get('dual') and os.path.exists(result['dual']):
+                                with open(result['dual'], 'rb') as f:
+                                    st.download_button(
+                                        "📥 Download Dual-language PDF",
+                                        f.read(),
+                                        f"{uploaded_file.name.replace('.pdf', '')}_dual.pdf",
+                                        "application/pdf",
+                                        use_container_width=True
+                                    )
+                        else:
+                            st.error(f"❌ Translation failed: {result.get('error', 'Unknown error')}")
+                    
                     except Exception as e:
-                        st.error(f"오류 발생: {e}")
-                        logger.error(f"번역 오류: {e}", exc_info=True)
+                        st.error(f"Error: {e}")
+                        logger.error(f"Translation error: {e}", exc_info=True)
                     
                     finally:
-                        # 임시 파일 정리
+                        # Cleanup
                         try:
                             if os.path.exists(input_path):
                                 os.unlink(input_path)
@@ -602,61 +577,34 @@ def main():
                         except:
                             pass
                         
-                        # 메모리 정리
-                        clear_memory()
+                        # Memory cleanup
+                        gc.collect()
     
     with tab2:
         st.markdown("""
-        ### 📖 사용 가이드
+        ### ℹ️ PDF Math Translator Pro
         
-        #### 🚀 빠른 시작
-        1. 첫 실행 시 "시작하기" 버튼을 클릭하여 필수 구성 요소 설치
-        2. PDF 파일 업로드
-        3. 번역 언어 선택
-        4. "번역 시작" 클릭
+        **Features:**
+        - ✅ Layout preservation with pdf2zh
+        - ✅ Math formula preservation
+        - ✅ Multi-language support
+        - ✅ Free Google translation
+        - ✅ High-quality OpenAI translation
         
-        #### 💡 기능
-        - ✅ **레이아웃 보존**: pdf2zh로 원본 레이아웃 유지
-        - ✅ **수식 보존**: 수학 공식과 기호 완벽 보존
-        - ✅ **이미지 텍스트 번역**: OCR로 이미지 내 텍스트 감지 및 번역
-        - ✅ **대조본 생성**: 원본과 번역본 페이지별 대조
+        **Tips:**
+        - Use pdf2zh for better results
+        - Google translation is free but lower quality
+        - OpenAI gives better translation but needs API key
+        - Large files may take several minutes
         
-        #### ⚙️ 최적화
-        - 메모리 사용량 실시간 모니터링
-        - 필요한 모듈만 지연 로딩
-        - 페이지별 처리로 메모리 절약
-        - 자동 가비지 컬렉션
+        **Limitations:**
+        - Streamlit Cloud: 1GB RAM limit
+        - Max file size: 200MB
+        - OCR not available in lite version
         
-        #### ⚠️ 제한사항
-        - Streamlit Cloud: 1GB RAM, 1GB 스토리지
-        - 큰 파일(>10MB)은 처리 시간이 오래 걸림
-        - OCR 사용 시 추가 시간 소요
-        """)
-    
-    with tab3:
-        st.markdown("""
-        ### ℹ️ PDF Math Translator Pro 정보
-        
-        **버전**: pdf2zh 1.9.0+ with OCR  
-        **최적화**: Streamlit Cloud (1GB RAM)  
-        **엔진**: OpenAI GPT / Google Translate  
-        
-        #### 🛠️ 기술 스택
-        - **PDF 처리**: pdf2zh, PyMuPDF
-        - **레이아웃 분석**: DocLayout-YOLO (ONNX)
-        - **OCR**: EasyOCR (CPU mode)
-        - **번역**: OpenAI API, Google Translate
-        - **메모리 관리**: psutil, gc
-        
-        #### 📊 메모리 최적화 전략
-        1. **지연 로딩**: OCR과 torch는 필요 시에만 로드
-        2. **CPU 전용**: GPU 비활성화로 메모리 절약
-        3. **페이지별 처리**: 대용량 PDF도 안정적 처리
-        4. **적극적 정리**: 각 단계마다 메모리 해제
-        
-        #### 🔗 관련 링크
+        **Links:**
         - [GitHub: PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
-        - [온라인 데모](https://pdf2zh.com)
+        - [pdf2zh Documentation](https://pdf2zh.com)
         - [OpenAI Platform](https://platform.openai.com)
         """)
 
