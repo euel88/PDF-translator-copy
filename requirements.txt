@@ -1,3 +1,4 @@
+# 기존 pdf2zh 요구사항
 streamlit>=1.28.0
 pdf2zh>=1.9.0
 openai>=1.0.0
@@ -19,3 +20,15 @@ peewee>=3.17.0
 fonttools>=4.43.0
 rich>=13.0.0
 python-dotenv>=1.0.0
+
+# 이미지 번역 추가 패키지
+easyocr>=1.7.0
+pytesseract>=0.3.10
+opencv-python>=4.8.0
+scipy>=1.10.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# OCR 언어 데이터 (선택사항)
+# Tesseract 언어 데이터는 별도 설치 필요:
+# sudo apt-get install tesseract-ocr-kor tesseract-ocr-jpn tesseract-ocr-chi-sim
