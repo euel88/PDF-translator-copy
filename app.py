@@ -1,6 +1,6 @@
 """
-PDF 번역기 - Streamlit Cloud 호환 버전
-OpenAI GPT를 활용한 고품질 PDF 번역
+PDF 번역기 - Streamlit Cloud 최적화 버전
+OpenAI GPT를 활용한 PDF 번역 (pdf2zh 선택적 사용)
 """
 
 import streamlit as st
@@ -12,10 +12,24 @@ import time
 import base64
 from datetime import datetime
 import logging
+import subprocess
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# pdf2zh 설치 시도
+PDF2ZH_AVAILABLE = False
+try:
+    # pdf2zh를 런타임에 설치 시도
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", "pdf2zh"], 
+                          capture_output=True, timeout=60)
+    import pdf2zh
+    PDF2ZH_AVAILABLE = True
+    logger.info("pdf2zh 모듈 로드 성공")
+except Exception as e:
+    logger.warning(f"pdf2zh 사용 불가: {e}")
+    logger.info("OpenAI Direct 모드로 실행됩니다")
 
 # Python 버전 확인
 python_version = sys.version_info
@@ -56,6 +70,13 @@ st.markdown("""
         border-radius: 8px;
         color: #991b1b;
     }
+    .warning-box {
+        background: #fef3c7;
+        border: 1px solid #f59e0b;
+        padding: 1rem;
+        border-radius: 8px;
+        color: #92400e;
+    }
     div[data-testid="metric-container"] {
         background: rgba(16, 163, 127, 0.1);
         border: 1px solid #10a37f;
@@ -74,9 +95,9 @@ if 'translation_history' not in st.session_state:
 def check_dependencies():
     """필수 패키지 확인"""
     dependencies = {
-        'pdf2zh': False,
         'PyPDF2': False,
-        'openai': False
+        'openai': False,
+        'pypdf': False
     }
     
     for package in dependencies.keys():
@@ -91,15 +112,58 @@ def check_dependencies():
 def get_pdf_page_count(file_content):
     """PDF 페이지 수 확인"""
     try:
-        import PyPDF2
+        import pypdf
         from io import BytesIO
         
         pdf_file = BytesIO(file_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        pdf_reader = pypdf.PdfReader(pdf_file)
         return len(pdf_reader.pages)
-    except Exception as e:
-        logger.error(f"PDF 페이지 수 확인 오류: {e}")
-        return 0
+    except ImportError:
+        try:
+            import PyPDF2
+            from io import BytesIO
+            
+            pdf_file = BytesIO(file_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            return len(pdf_reader.pages)
+        except Exception as e:
+            logger.error(f"PDF 페이지 수 확인 오류: {e}")
+            return 0
+
+def extract_text_from_pdf(file_content):
+    """PDF에서 텍스트 추출"""
+    try:
+        import pypdf
+        from io import BytesIO
+        
+        pdf_file = BytesIO(file_content)
+        pdf_reader = pypdf.PdfReader(pdf_file)
+        
+        text_by_page = []
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            text = page.extract_text()
+            text_by_page.append(text)
+        
+        return text_by_page
+    except ImportError:
+        try:
+            import PyPDF2
+            from io import BytesIO
+            
+            pdf_file = BytesIO(file_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            text_by_page = []
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text = page.extract_text()
+                text_by_page.append(text)
+            
+            return text_by_page
+        except Exception as e:
+            logger.error(f"텍스트 추출 오류: {e}")
+            return []
 
 def estimate_cost(pages: int, model: str) -> dict:
     """OpenAI API 비용 추정"""
@@ -110,6 +174,8 @@ def estimate_cost(pages: int, model: str) -> dict:
         "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
         "gpt-4": {"input": 0.03, "output": 0.06},
         "gpt-4-turbo": {"input": 0.01, "output": 0.03},
+        "gpt-4o": {"input": 0.005, "output": 0.015},
+        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
     }
     
     if model in prices:
@@ -125,162 +191,135 @@ def estimate_cost(pages: int, model: str) -> dict:
     
     return {"tokens": total_tokens, "cost_usd": 0, "cost_krw": 0}
 
-def translate_with_pdf2zh_module(
-    input_file: str,
-    output_file: str,
-    api_key: str,
-    model: str,
-    source_lang: str,
-    target_lang: str,
-    pages: str = None,
-    file_type: str = "mono",
-    progress_callback = None
-):
-    """pdf2zh 모듈을 직접 import하여 번역"""
-    try:
-        # 환경 변수 설정
-        os.environ["OPENAI_API_KEY"] = api_key
-        os.environ["OPENAI_MODEL"] = model
-        os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
-        
-        # pdf2zh를 Python 모듈로 import
-        try:
-            from pdf2zh import translate_patch
-            
-            # translate_patch 함수 직접 호출
-            translate_patch(
-                input_file,
-                output_file,
-                service="openai",
-                lang_in=source_lang,
-                lang_out=target_lang,
-                pages=pages,
-                dual_mode=(file_type == "dual")
-            )
-            
-            return True, output_file, "번역 완료"
-            
-        except ImportError:
-            # pdf2zh import 실패 시 대체 방법
-            logger.warning("pdf2zh 모듈 import 실패, CLI 시도")
-            
-            # pdf2zh를 명령줄로 실행 (PATH 문제 해결)
-            import subprocess
-            
-            # pdf2zh 실행 파일 찾기
-            pdf2zh_paths = [
-                "/home/appuser/.local/bin/pdf2zh",
-                "/home/adminuser/.local/bin/pdf2zh",
-                "/usr/local/bin/pdf2zh",
-                "pdf2zh"
-            ]
-            
-            pdf2zh_cmd = None
-            for path in pdf2zh_paths:
-                try:
-                    result = subprocess.run([path, "--version"], capture_output=True, timeout=5)
-                    if result.returncode == 0:
-                        pdf2zh_cmd = path
-                        break
-                except:
-                    continue
-            
-            if not pdf2zh_cmd:
-                # Python 모듈로 실행
-                pdf2zh_cmd = [sys.executable, "-m", "pdf2zh"]
-            else:
-                pdf2zh_cmd = [pdf2zh_cmd]
-            
-            # 명령어 구성
-            cmd = pdf2zh_cmd + [
-                input_file,
-                "-o", output_file,
-                "-s", "openai",
-                "-li", source_lang,
-                "-lo", target_lang
-            ]
-            
-            if pages:
-                cmd.extend(["-p", pages])
-            
-            if file_type == "dual":
-                cmd.append("--dual")
-            
-            # 실행
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=os.environ.copy()
-            )
-            
-            if result.returncode == 0:
-                return True, output_file, "번역 완료"
-            else:
-                return False, None, f"번역 실패: {result.stderr}"
-                
-    except Exception as e:
-        logger.error(f"번역 오류: {e}")
-        return False, None, str(e)
-
 def translate_with_openai_direct(
-    input_file: str,
-    output_file: str,
+    file_content,
     api_key: str,
     model: str,
     source_lang: str,
     target_lang: str,
+    pages: list = None,
     progress_callback = None
 ):
-    """OpenAI API를 직접 호출하여 번역 (pdf2zh 없이)"""
+    """OpenAI API를 직접 호출하여 번역"""
     try:
         import openai
-        from PyPDF2 import PdfReader, PdfWriter
         
         # OpenAI 클라이언트 설정
         client = openai.OpenAI(api_key=api_key)
         
-        # PDF 읽기
-        reader = PdfReader(input_file)
-        writer = PdfWriter()
+        # PDF에서 텍스트 추출
+        text_pages = extract_text_from_pdf(file_content)
         
-        total_pages = len(reader.pages)
+        if not text_pages:
+            return False, None, "PDF에서 텍스트를 추출할 수 없습니다"
         
-        for i, page in enumerate(reader.pages):
+        # 선택된 페이지만 처리
+        if pages:
+            selected_pages = []
+            for p in pages:
+                if 0 <= p < len(text_pages):
+                    selected_pages.append(text_pages[p])
+            text_pages = selected_pages
+        
+        if not text_pages:
+            return False, None, "선택된 페이지가 없습니다"
+        
+        total_pages = len(text_pages)
+        translated_pages = []
+        
+        for i, page_text in enumerate(text_pages):
             if progress_callback:
                 progress_callback((i + 1) / total_pages, i + 1, total_pages)
             
-            # 텍스트 추출
-            text = page.extract_text()
-            
-            if text.strip():
+            if page_text.strip():
                 # OpenAI API로 번역
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": f"Translate the following text from {source_lang} to {target_lang}. Preserve all formatting, equations, and technical terms."},
-                        {"role": "user", "content": text}
-                    ],
-                    temperature=0.3
-                )
-                
-                translated_text = response.choices[0].message.content
-                
-                # 번역된 텍스트로 새 페이지 생성 (간단한 구현)
-                # 실제로는 레이아웃 보존이 복잡함
-                writer.add_page(page)
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {
+                                "role": "system", 
+                                "content": f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Preserve all formatting and technical terms."
+                            },
+                            {"role": "user", "content": page_text}
+                        ],
+                        temperature=0.3
+                    )
+                    
+                    translated_text = response.choices[0].message.content
+                    translated_pages.append(translated_text)
+                except Exception as e:
+                    logger.error(f"페이지 {i+1} 번역 오류: {e}")
+                    translated_pages.append(f"[번역 오류: {str(e)}]\n\n{page_text}")
             else:
-                writer.add_page(page)
+                translated_pages.append("")
         
-        # PDF 저장
-        with open(output_file, 'wb') as f:
-            writer.write(f)
+        # 번역된 텍스트를 파일로 저장
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            for i, text in enumerate(translated_pages):
+                f.write(f"=== 페이지 {i+1} ===\n\n")
+                f.write(text)
+                f.write("\n\n")
+            output_file = f.name
         
         return True, output_file, "번역 완료"
         
     except Exception as e:
         logger.error(f"Direct OpenAI 번역 오류: {e}")
+        return False, None, str(e)
+
+def translate_with_pdf2zh_cli(
+    input_file: str,
+    output_dir: str,
+    api_key: str,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+    pages: str = None,
+    progress_callback = None
+):
+    """pdf2zh CLI를 사용한 번역 (폴백)"""
+    try:
+        # 환경 변수 설정
+        env = os.environ.copy()
+        env["OPENAI_API_KEY"] = api_key
+        env["OPENAI_MODEL"] = model
+        
+        # 명령어 구성
+        cmd = [
+            sys.executable, "-m", "pdf2zh",
+            input_file,
+            "-o", output_dir,
+            "-s", "openai",
+            "-li", source_lang,
+            "-lo", target_lang,
+            "-t", "1"  # 단일 스레드
+        ]
+        
+        if pages:
+            cmd.extend(["-p", pages])
+        
+        # 실행
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env
+        )
+        
+        if result.returncode == 0:
+            # 출력 파일 찾기
+            output_files = list(Path(output_dir).glob("*-mono.pdf"))
+            if output_files:
+                return True, str(output_files[0]), "번역 완료"
+            else:
+                return True, None, "번역 완료 (PDF 생성 실패, 텍스트만 제공)"
+        else:
+            return False, None, f"번역 실패: {result.stderr}"
+            
+    except Exception as e:
+        logger.error(f"pdf2zh CLI 오류: {e}")
         return False, None, str(e)
 
 def main():
@@ -290,28 +329,24 @@ def main():
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.title("🤖 AI PDF 번역기")
-        st.caption("ChatGPT로 과학 논문을 정확하게 번역 - 수식과 레이아웃 보존")
+        st.caption("ChatGPT로 PDF 문서를 번역 - Streamlit Cloud Edition")
     with col2:
         st.metric("번역 문서", len(st.session_state.translation_history), "📚")
     with col3:
         # 의존성 체크
         deps = check_dependencies()
         all_ok = all(deps.values())
-        st.metric("상태", "✅ 정상" if all_ok else "⚠️ 확인", "🔧")
+        st.metric("상태", "✅ 정상" if all_ok else "⚠️ 제한", "🔧")
     
-    # 의존성 확인
-    if not all_ok:
-        st.warning("⚠️ 일부 패키지가 누락되었습니다")
-        with st.expander("📦 패키지 상태"):
-            for package, status in deps.items():
-                st.write(f"{'✅' if status else '❌'} {package}")
-        
-        st.info("""
-        **해결 방법:**
-        1. 로컬 환경: `pip install pdf2zh openai PyPDF2`
-        2. Streamlit Cloud: requirements.txt 확인
-        3. 문제 지속 시: OpenAI Direct 모드 사용 (아래)
-        """)
+    # pdf2zh 상태 알림
+    if not PDF2ZH_AVAILABLE:
+        st.markdown("""
+        <div class="warning-box">
+        ⚠️ <b>제한된 모드로 실행 중</b><br>
+        pdf2zh 모듈을 사용할 수 없어 기본 텍스트 추출 방식으로 작동합니다.<br>
+        레이아웃 보존이 제한될 수 있습니다.
+        </div>
+        """, unsafe_allow_html=True)
     
     # API 키 설정
     if not st.session_state.api_key:
@@ -364,28 +399,26 @@ def main():
         
         st.divider()
         
-        # 번역 모드 선택
+        # 번역 모드
         st.subheader("🔧 번역 엔진")
         
-        # pdf2zh 사용 가능 여부 확인
-        pdf2zh_available = deps.get('pdf2zh', False)
-        
-        if pdf2zh_available:
+        if PDF2ZH_AVAILABLE:
             translation_mode = st.radio(
                 "번역 방식",
                 ["pdf2zh (권장)", "OpenAI Direct"],
-                help="pdf2zh는 레이아웃을 완벽하게 보존합니다"
+                help="pdf2zh는 레이아웃을 보존합니다"
             )
         else:
             translation_mode = "OpenAI Direct"
-            st.info("pdf2zh를 사용할 수 없어 Direct 모드로 실행됩니다")
+            st.info("OpenAI Direct 모드로 고정")
         
         # GPT 모델 선택
         st.subheader("🧠 AI 모델")
         model = st.selectbox(
             "GPT 모델",
-            ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o-mini", "gpt-4o"],
-            help="gpt-4o가 가장 최신 모델입니다"
+            ["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+            index=1,
+            help="gpt-4o-mini가 비용 대비 성능이 좋습니다"
         )
         
         # 언어 설정
@@ -413,22 +446,16 @@ def main():
             index=0
         )
         
-        # 고급 옵션
+        # 페이지 선택
         with st.expander("🔧 고급 옵션"):
-            file_type = st.radio(
-                "출력 형식",
-                ["mono", "dual"],
-                format_func=lambda x: "번역만" if x == "mono" else "원본+번역"
-            )
-            
-            pages = st.text_input(
+            page_range = st.text_input(
                 "페이지 범위",
-                placeholder="예: 1-10, 15",
-                help="비용 절감을 위해 특정 페이지만 번역"
+                placeholder="예: 1-5, 10",
+                help="비어있으면 전체 번역"
             )
     
     # 메인 영역
-    tab1, tab2, tab3 = st.tabs(["📤 번역하기", "🔧 문제 해결", "ℹ️ 정보"])
+    tab1, tab2, tab3 = st.tabs(["📤 번역하기", "💡 도움말", "ℹ️ 정보"])
     
     with tab1:
         # 파일 업로드
@@ -488,8 +515,8 @@ def main():
                 **설정 확인**
                 - 🧠 {model}
                 - 🌐 {source_lang} → {target_lang}
-                - 📄 {'원본+번역' if file_type == 'dual' else '번역만'}
-                - 🔧 {translation_mode}
+                - 🔧 {translation_mode if PDF2ZH_AVAILABLE else 'Direct'}
+                - 📄 {page_range if page_range else '전체'}
                 """)
                 
                 # 번역 버튼
@@ -498,47 +525,65 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    # 임시 파일 저장
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_input:
-                        tmp_input.write(file_content)
-                        input_path = tmp_input.name
-                    
-                    output_path = input_path.replace('.pdf', '_translated.pdf')
-                    
                     # 진행률 콜백
                     def update_progress(progress, current, total):
                         progress_bar.progress(progress)
                         status_text.text(f"🤖 번역 중... 페이지 {current}/{total}")
                     
+                    # 페이지 범위 파싱
+                    selected_pages = []
+                    if page_range:
+                        try:
+                            for p in page_range.split(","):
+                                p = p.strip()
+                                if "-" in p:
+                                    start, end = p.split("-")
+                                    selected_pages.extend(range(int(start)-1, int(end)))
+                                else:
+                                    selected_pages.append(int(p)-1)
+                        except:
+                            st.error("잘못된 페이지 범위입니다")
+                            st.stop()
+                    
                     # 번역 실행
                     start_time = time.time()
                     
-                    if "pdf2zh" in translation_mode:
-                        success, output_file, message = translate_with_pdf2zh_module(
+                    if PDF2ZH_AVAILABLE and "pdf2zh" in translation_mode:
+                        # pdf2zh 사용
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_input:
+                            tmp_input.write(file_content)
+                            input_path = tmp_input.name
+                        
+                        output_dir = tempfile.mkdtemp()
+                        
+                        success, output_file, message = translate_with_pdf2zh_cli(
                             input_path,
-                            output_path,
+                            output_dir,
                             st.session_state.api_key,
                             model,
                             lang_map[source_lang],
                             lang_map[target_lang],
-                            pages,
-                            file_type,
+                            page_range,
                             update_progress
                         )
+                        
+                        # 임시 파일 정리
+                        os.unlink(input_path)
                     else:
+                        # OpenAI Direct 사용
                         success, output_file, message = translate_with_openai_direct(
-                            input_path,
-                            output_path,
+                            file_content,
                             st.session_state.api_key,
                             model,
                             source_lang,
                             target_lang,
+                            selected_pages,
                             update_progress
                         )
                     
                     elapsed = time.time() - start_time
                     
-                    if success and output_file and os.path.exists(output_file):
+                    if success:
                         st.balloons()
                         progress_bar.progress(1.0)
                         status_text.text("✅ 번역 완료!")
@@ -550,18 +595,40 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        # 다운로드
-                        with open(output_file, 'rb') as f:
-                            pdf_data = f.read()
-                        
-                        st.download_button(
-                            label="📥 번역된 PDF 다운로드",
-                            data=pdf_data,
-                            file_name=f"translated_{uploaded_file.name}",
-                            mime="application/pdf",
-                            use_container_width=True,
-                            type="primary"
-                        )
+                        if output_file and os.path.exists(output_file):
+                            # 다운로드
+                            with open(output_file, 'rb') as f:
+                                result_data = f.read()
+                            
+                            # 파일 확장자 결정
+                            if output_file.endswith('.pdf'):
+                                mime_type = "application/pdf"
+                                file_ext = "pdf"
+                            else:
+                                mime_type = "text/plain"
+                                file_ext = "txt"
+                            
+                            st.download_button(
+                                label=f"📥 번역 결과 다운로드 (.{file_ext})",
+                                data=result_data,
+                                file_name=f"translated_{uploaded_file.name.replace('.pdf', f'.{file_ext}')}",
+                                mime=mime_type,
+                                use_container_width=True,
+                                type="primary"
+                            )
+                            
+                            # 텍스트 파일인 경우 미리보기
+                            if file_ext == "txt":
+                                with st.expander("📝 번역 결과 미리보기"):
+                                    st.text(result_data.decode('utf-8', errors='ignore')[:2000] + "...")
+                            
+                            # 임시 파일 정리
+                            try:
+                                os.unlink(output_file)
+                            except:
+                                pass
+                        else:
+                            st.warning("번역은 완료되었으나 파일 생성에 실패했습니다")
                         
                         # 기록
                         st.session_state.translation_history.append({
@@ -570,13 +637,6 @@ def main():
                             'model': model,
                             'time': datetime.now().strftime("%H:%M")
                         })
-                        
-                        # 정리
-                        try:
-                            os.unlink(input_path)
-                            os.unlink(output_file)
-                        except:
-                            pass
                     else:
                         st.error(f"❌ 번역 실패")
                         st.markdown(f"""
@@ -588,76 +648,90 @@ def main():
                         
                         with st.expander("🔍 디버깅 정보"):
                             st.code(message)
-                            st.write("**Python 경로:**", sys.executable)
-                            st.write("**작업 디렉토리:**", os.getcwd())
-                            st.write("**PATH:**", os.environ.get('PATH', ''))
+                            st.write("**Python:**", sys.version)
+                            st.write("**pdf2zh:**", "사용 가능" if PDF2ZH_AVAILABLE else "사용 불가")
     
     with tab2:
         st.markdown("""
-        ### 🔧 문제 해결 가이드
+        ### 💡 사용 가이드
         
-        #### Streamlit Cloud 배포 시
+        #### 🚀 빠른 시작
+        1. OpenAI API 키 입력 (첫 실행 시)
+        2. PDF 파일 업로드
+        3. 언어 설정 확인
+        4. 번역 시작 클릭
         
-        **requirements.txt 필수 내용:**
-        ```
-        streamlit>=1.28.0
-        pdf2zh>=1.9.0
-        PyPDF2>=3.0.0
-        openai>=1.0.0
-        ```
+        #### ⚠️ 제한사항 (Streamlit Cloud)
+        - 파일 크기: 최대 200MB
+        - 실행 시간: 최대 10분
+        - pdf2zh가 작동하지 않을 경우 텍스트만 추출됩니다
         
-        **환경 변수 설정:**
-        1. Streamlit Cloud 대시보드 → Settings
-        2. Secrets에 추가:
-        ```
-        OPENAI_API_KEY = "sk-your-key"
-        ```
+        #### 💰 비용 절감 팁
+        - `gpt-4o-mini` 모델 사용 (성능 대비 저렴)
+        - 필요한 페이지만 선택하여 번역
+        - 긴 문서는 나눠서 번역
         
-        #### 일반적인 오류 해결
+        #### 📝 페이지 범위 지정
+        - 전체: 비워두기
+        - 특정 페이지: `1, 3, 5`
+        - 범위: `1-10`
+        - 혼합: `1-5, 10, 15-20`
         
-        | 오류 | 원인 | 해결 방법 |
-        |------|------|----------|
-        | pdf2zh not found | PATH 문제 | OpenAI Direct 모드 사용 |
-        | API 키 오류 | 잘못된 키 | 키 재확인 |
-        | 시간 초과 | 큰 파일 | 페이지 범위 지정 |
-        | Python 버전 | 3.13+ | 3.12 이하 사용 |
+        #### 🔧 문제 해결
+        **"pdf2zh 사용 불가" 메시지**
+        - 정상입니다. OpenAI Direct 모드로 작동합니다
+        - 텍스트 추출만 가능하며 레이아웃은 보존되지 않습니다
         
-        #### 디버그 모드
+        **번역이 느린 경우**
+        - 페이지 수가 많으면 시간이 오래 걸립니다
+        - 필요한 페이지만 선택하세요
         
-        현재 환경 정보:
-        - Python: {sys.version}
-        - Platform: {sys.platform}
-        - CWD: {os.getcwd()}
+        **오류 발생 시**
+        - API 키 확인
+        - 파일 크기 확인 (200MB 이하)
+        - 다른 모델로 시도
         """)
     
     with tab3:
         st.markdown("""
-        ### 🤖 AI PDF 번역기
+        ### 🤖 AI PDF 번역기 정보
         
-        **버전**: 2.1.0 (Cloud Compatible)  
-        **엔진**: OpenAI GPT + pdf2zh  
+        **버전**: 2.2.0 (Streamlit Cloud Edition)  
+        **엔진**: OpenAI GPT + pdf2zh (선택적)  
+        **환경**: Streamlit Cloud  
         
         #### ✨ 특징
-        
         - 🤖 ChatGPT 기반 고품질 번역
-        - 📐 수식과 레이아웃 보존
-        - ☁️ Streamlit Cloud 호환
-        - 🔧 자동 오류 복구
+        - ☁️ Streamlit Cloud 최적화
+        - 🔧 자동 폴백 메커니즘
+        - 📊 비용 사전 계산
         
         #### 📊 모델 비교
         
         | 모델 | 속도 | 품질 | 비용 |
         |------|------|------|------|
         | gpt-3.5-turbo | ⚡⚡⚡ | ⭐⭐⭐ | 💰 |
-        | gpt-4o-mini | ⚡⚡ | ⭐⭐⭐⭐ | 💰💰 |
-        | gpt-4o | ⚡ | ⭐⭐⭐⭐⭐ | 💰💰💰 |
+        | gpt-4o-mini | ⚡⚡ | ⭐⭐⭐⭐ | 💰 |
+        | gpt-4o | ⚡ | ⭐⭐⭐⭐⭐ | 💰💰 |
+        | gpt-4-turbo | ⚡ | ⭐⭐⭐⭐⭐ | 💰💰💰 |
         
-        #### 🔗 링크
-        
+        #### 🔗 관련 링크
         - [OpenAI API](https://platform.openai.com)
         - [PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
-        - [Streamlit Cloud](https://streamlit.io/cloud)
+        - [Streamlit](https://streamlit.io)
+        
+        #### 📝 라이선스
+        이 앱은 오픈소스 프로젝트들을 활용합니다.
+        - PDFMathTranslate: AGPL-3.0
+        - Streamlit: Apache 2.0
         """)
+        
+        # 번역 기록
+        if st.session_state.translation_history:
+            st.divider()
+            st.subheader("📚 번역 기록")
+            for item in st.session_state.translation_history[-5:]:
+                st.text(f"• {item['time']} - {item['filename']} ({item['pages']}페이지, {item['model']})")
 
 if __name__ == "__main__":
     main()
