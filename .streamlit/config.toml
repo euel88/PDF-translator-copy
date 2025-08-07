@@ -1,22 +1,38 @@
 [theme]
-primaryColor = "#165DFF"
+# 보라색 그라데이션 테마
+primaryColor = "#667eea"
 backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f0f2f6"
 textColor = "#262730"
 font = "sans serif"
 
 [server]
+# 서버 설정
 maxUploadSize = 200
 maxMessageSize = 200
 enableCORS = false
 enableXsrfProtection = true
+headless = true
+port = 8501
 
 [browser]
+# 브라우저 설정
 gatherUsageStats = false
 serverAddress = "0.0.0.0"
 serverPort = 8501
 
 [runner]
+# 실행 설정
 magicEnabled = true
 installTracker = false
 fixMatplotlib = true
+fastReruns = false
+
+[client]
+# 클라이언트 설정
+showErrorDetails = true
+toolbarMode = "minimal"
+
+[ui]
+# UI 설정
+hideTopBar = false
