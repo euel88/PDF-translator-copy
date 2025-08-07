@@ -1,7 +1,6 @@
 """
-Image Processor Module - 수정된 버전
+Image Processor Module
 이미지 추출, 텍스트 감지, 이미지 수정을 담당하는 모듈
-PyMuPDF API 호환성 문제 해결
 """
 
 import logging
@@ -13,30 +12,26 @@ import cv2
 import fitz  # PyMuPDF
 import easyocr
 from pathlib import Path
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class ImageProcessor:
-    """이미지 처리 전문 클래스 - 수정된 버전"""
+    """이미지 처리 전문 클래스"""
     
-    def __init__(self, ocr_languages: List[str] = None, max_workers: int = 4):
+    def __init__(self, ocr_languages: List[str] = None):
         """
         초기화
         
         Args:
             ocr_languages: OCR에 사용할 언어 목록
-            max_workers: 병렬 처리를 위한 최대 워커 수
         """
         self.ocr_languages = ocr_languages or ['en']
         self.ocr_reader = None
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self._init_ocr()
     
     def _init_ocr(self):
-        """OCR 엔진 초기화 - 개선된 에러 처리"""
+        """OCR 엔진 초기화"""
         try:
             # 언어 코드 매핑
             lang_map = {
@@ -61,10 +56,6 @@ class ImageProcessor:
                 if mapped_lang not in ocr_langs:
                     ocr_langs.append(mapped_lang)
             
-            # 기본 언어 추가 (폴백용)
-            if 'en' not in ocr_langs:
-                ocr_langs.append('en')
-            
             # GPU 사용 가능 여부 확인
             gpu = self._check_gpu()
             
@@ -73,12 +64,11 @@ class ImageProcessor:
             
         except Exception as e:
             logger.error(f"OCR 초기화 실패: {e}")
-            # 최소한의 폴백 설정
+            # 폴백: 영어만 사용
             try:
-                logger.info("폴백: CPU에서 영어 OCR만 사용")
                 self.ocr_reader = easyocr.Reader(['en'], gpu=False)
             except:
-                logger.error("OCR 완전 실패 - OCR 기능 비활성화")
+                logger.error("OCR 완전 실패")
                 self.ocr_reader = None
     
     def _check_gpu(self) -> bool:
@@ -88,15 +78,6 @@ class ImageProcessor:
             return torch.cuda.is_available()
         except:
             return False
-    
-    async def extract_images_from_pdf_async(self, pdf_path: str) -> List[Dict]:
-        """PDF에서 모든 이미지 비동기 추출"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.executor,
-            self.extract_images_from_pdf,
-            pdf_path
-        )
     
     def extract_images_from_pdf(self, pdf_path: str) -> List[Dict]:
         """
@@ -135,8 +116,7 @@ class ImageProcessor:
                 # PIL 이미지로 변환
                 if pix.alpha:
                     pix = fitz.Pixmap(pix, 0)  # 알파 채널 제거
-                    
-                img_data = pix.tobytes("png")  # 수정: pil_tobytes -> tobytes
+                img_data = pix.pil_tobytes(format="PNG")
                 image = Image.open(io.BytesIO(img_data))
                 
                 # 이미지 정보 저장
@@ -227,117 +207,47 @@ class ImageProcessor:
             # 선명도 향상
             image = image.filter(ImageFilter.SHARPEN)
             
+            # 이진화 (선택적)
+            # threshold = 128
+            # image = image.point(lambda p: p > threshold and 255)
+            
             return image
             
         except Exception as e:
             logger.error(f"이미지 향상 오류: {e}")
             return image
     
-    def replace_image_in_page(self, page, xref: int, new_image: Image.Image) -> bool:
+    def extract_images_with_text(self, pdf_path: str, 
+                                confidence_threshold: float = 0.5) -> List[Dict]:
         """
-        페이지의 이미지 교체 - PyMuPDF API 호환성 수정
+        PDF에서 텍스트가 포함된 이미지만 추출
         
         Args:
-            page: PDF 페이지 객체
-            xref: 교체할 이미지의 xref
-            new_image: 새 이미지
+            pdf_path: PDF 파일 경로
+            confidence_threshold: OCR 신뢰도 임계값
             
         Returns:
-            성공 여부
+            텍스트가 포함된 이미지 정보 리스트
         """
-        try:
-            # 이미지를 PNG 바이트로 변환
-            img_buffer = io.BytesIO()
-            new_image.save(img_buffer, format='PNG')
-            img_data = img_buffer.getvalue()
-            
-            # 방법 1: 스트림 직접 업데이트 시도
-            try:
-                # 기존 이미지의 스트림을 새 이미지로 교체
-                page.parent.update_stream(xref, img_data)
-                
-                # 이미지 딕셔너리 업데이트
-                img_dict = page.parent.xref_object(xref)
-                if img_dict:
-                    img_dict["Width"] = new_image.width
-                    img_dict["Height"] = new_image.height
-                    page.parent.update_object(xref, str(img_dict))
-                
-                logger.info(f"이미지 교체 성공: xref={xref}")
-                return True
-                
-            except AttributeError:
-                # 방법 2: 새 이미지 추가 후 참조 변경
-                logger.info("스트림 업데이트 실패, 대체 방법 시도")
-                
-                # 새 이미지 삽입
-                img_rect = page.get_image_bbox(xref)
-                page.insert_image(
-                    img_rect,
-                    stream=img_data,
-                    keep_proportion=True
-                )
-                
-                # 기존 이미지 숨기기 (흰색 사각형으로 덮기)
-                page.draw_rect(img_rect, color=(1, 1, 1), fill=(1, 1, 1))
-                
-                return True
-                
-        except Exception as e:
-            logger.error(f"이미지 교체 실패: {e}")
-            # 방법 3: 폴백 - 이미지 위에 텍스트 오버레이
-            return self._add_text_overlay_fallback(page, xref, new_image)
-    
-    def _add_text_overlay_fallback(self, page, xref: int, new_image: Image.Image) -> bool:
-        """
-        폴백: 이미지를 교체하는 대신 텍스트를 오버레이로 추가
+        # 모든 이미지 추출
+        all_images = self.extract_images_from_pdf(pdf_path)
         
-        Args:
-            page: PDF 페이지
-            xref: 이미지 xref  
-            new_image: 텍스트가 포함된 새 이미지
-            
-        Returns:
-            성공 여부
-        """
-        try:
-            # 이미지 위치 가져오기
-            img_info = None
-            for img in page.get_images():
-                if img[0] == xref:
-                    img_info = img
-                    break
-            
-            if not img_info:
-                return False
-            
-            img_rect = page.get_image_bbox(img_info)
-            
-            # 반투명 흰색 배경 추가
-            page.draw_rect(
-                img_rect,
-                color=(1, 1, 1),
-                fill=(1, 1, 1),
-                opacity=0.7
+        # 텍스트가 있는 이미지만 필터링
+        images_with_text = []
+        
+        for img_info in all_images:
+            # 텍스트 감지
+            texts = self.detect_text_in_image(
+                img_info['image'],
+                confidence_threshold=confidence_threshold
             )
             
-            # 새 이미지를 오버레이로 추가
-            img_buffer = io.BytesIO()
-            new_image.save(img_buffer, format='PNG')
-            img_data = img_buffer.getvalue()
-            
-            page.insert_image(
-                img_rect,
-                stream=img_data,
-                overlay=True
-            )
-            
-            logger.info(f"텍스트 오버레이 추가 완료: xref={xref}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"텍스트 오버레이 추가 실패: {e}")
-            return False
+            if texts:
+                img_info['texts'] = texts
+                images_with_text.append(img_info)
+                logger.info(f"페이지 {img_info['page']}, 이미지 {img_info['index']}: {len(texts)}개 텍스트 감지")
+        
+        return images_with_text
     
     def create_text_overlay(self, image: Image.Image, 
                           texts: List[Dict],
@@ -347,7 +257,7 @@ class ImageProcessor:
                           bg_color: Tuple[int, int, int, int] = (255, 255, 255, 200),
                           preserve_layout: bool = True) -> Image.Image:
         """
-        이미지에 번역된 텍스트 오버레이 생성
+        이미지에 텍스트 오버레이 생성
         
         Args:
             image: 원본 이미지
@@ -384,11 +294,21 @@ class ImageProcessor:
         # 각 텍스트 처리
         for text_info in texts:
             if preserve_layout:
+                # 원본 위치에 텍스트 배치
                 self._draw_text_at_position(
                     draw_overlay, 
                     text_info, 
                     font, 
                     text_color, 
+                    bg_color
+                )
+            else:
+                # 새로운 레이아웃으로 텍스트 배치
+                self._draw_text_new_layout(
+                    draw_overlay,
+                    text_info,
+                    font,
+                    text_color,
                     bg_color
                 )
         
@@ -413,7 +333,7 @@ class ImageProcessor:
         y_min = text_info['y_min']
         y_max = text_info['y_max']
         
-        # 배경 그리기
+        # 배경 박스 그리기
         draw.rectangle(
             [(x_min, y_min), (x_max, y_max)],
             fill=bg_color
@@ -427,9 +347,74 @@ class ImageProcessor:
             font=font
         )
     
-    def cleanup(self):
-        """리소스 정리"""
-        if self.executor:
-            self.executor.shutdown(wait=True)
-        self.ocr_reader = None
-        logger.info("ImageProcessor 리소스 정리 완료")
+    def _draw_text_new_layout(self, draw, text_info: Dict, font,
+                            text_color, bg_color):
+        """새로운 레이아웃으로 텍스트 배치"""
+        # 구현 필요: 텍스트를 새로운 레이아웃으로 재배치
+        self._draw_text_at_position(draw, text_info, font, text_color, bg_color)
+    
+    def replace_image_in_pdf(self, doc: fitz.Document, page_num: int, 
+                            xref: int, new_image: Image.Image) -> bool:
+        """
+        PDF 페이지의 이미지 교체 (수정된 PyMuPDF API 사용)
+        
+        Args:
+            doc: PDF 문서 객체
+            page_num: 페이지 번호
+            xref: 이미지 xref
+            new_image: 새 이미지
+            
+        Returns:
+            성공 여부
+        """
+        try:
+            # 이미지를 바이트로 변환
+            img_buffer = io.BytesIO()
+            new_image.save(img_buffer, format='PNG')
+            img_data = img_buffer.getvalue()
+            
+            # 이미지 스트림 업데이트 (올바른 PyMuPDF API)
+            doc.update_stream(xref, img_data)
+            
+            # 이미지 메타데이터 가져오기 및 업데이트
+            img_dict = doc.xref_object(xref)
+            
+            # 딕셔너리 문자열 파싱 및 수정
+            new_dict = img_dict.replace(
+                f"/Width {doc.xref_get_key(xref, 'Width')[1]}",
+                f"/Width {new_image.width}"
+            ).replace(
+                f"/Height {doc.xref_get_key(xref, 'Height')[1]}",  
+                f"/Height {new_image.height}"
+            )
+            
+            # 수정된 메타데이터 업데이트
+            doc.update_object(xref, new_dict)
+            
+            logger.info(f"이미지 교체 성공: xref={xref}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"이미지 교체 실패: {e}")
+            # 폴백: 페이지에 오버레이 추가
+            try:
+                page = doc[page_num]
+                img_rect = page.get_image_bbox(xref)
+                
+                # 이미지를 임시 파일로 저장
+                temp_img = io.BytesIO()
+                new_image.save(temp_img, format='PNG')
+                temp_img.seek(0)
+                
+                # 페이지에 이미지 삽입
+                page.insert_image(
+                    img_rect,
+                    stream=temp_img,
+                    overlay=True
+                )
+                logger.info(f"이미지 오버레이로 대체: xref={xref}")
+                return True
+                
+            except Exception as e2:
+                logger.error(f"오버레이도 실패: {e2}")
+                return False
