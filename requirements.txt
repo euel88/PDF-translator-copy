@@ -60,3 +60,8 @@ huggingface-hub>=0.19.0
 # black>=23.0.0
 # flake8>=6.0.0
 # mypy>=1.0.0
+
+asyncio
+aiofiles
+nest-asyncio
+tqdm>=4.66.0
