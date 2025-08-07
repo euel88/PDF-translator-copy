@@ -5,32 +5,24 @@ openai>=1.0.0
 
 # PDF processing
 PyPDF2>=3.0.0
-pymupdf>=1.23.0
+pymupdf>=1.23.0,<1.25.3
 pikepdf>=8.0.0
 pdfminer.six>=20231228
 
-# OCR and image processing
-easyocr>=1.7.0
-opencv-python-headless>=4.8.0
-opencv-contrib-python>=4.8.0
+# OCR - CPU 버전만 (GPU 제외)
+# easyocr 대신 직접 의존성 설치로 크기 감소
+opencv-python-headless==4.8.1.78
 Pillow>=10.0.0
-numpy>=1.24.0
+numpy<2.0.0
 
-# Deep learning for OCR
-torch>=2.0.0
-torchvision>=0.15.0
+# OCR 모델 - 런타임 다운로드 (requirements에서 제외)
+# torch와 torchvision은 스크립트에서 CPU 버전만 설치
 
-# Translation services
-googletrans==4.0.0rc1
-deepl>=1.15.0
-azure-ai-translation-text>=1.0.0
-
-# UI components
-gradio-pdf>=0.0.21
-
-# Utilities
+# Translation
 requests>=2.31.0
 tenacity>=8.2.0
+
+# Utilities
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 
@@ -41,27 +33,14 @@ fonttools>=4.43.0
 onnx>=1.14.0
 onnxruntime>=1.16.0
 
-# Data processing
+# Data
 peewee>=3.17.0
-rich>=13.0.0
 
-# Hugging Face
+# HuggingFace for model download
 huggingface-hub>=0.19.0
 
-# Optional: Tesseract OCR (alternative to EasyOCR)
-# pytesseract>=0.3.10
+# Memory optimization
+psutil>=5.9.0
 
-# Optional: PaddleOCR (alternative OCR engine)
-# paddlepaddle>=2.5.0
-# paddleocr>=2.7.0
-
-# Development tools (optional)
-# pytest>=7.4.0
-# black>=23.0.0
-# flake8>=6.0.0
-# mypy>=1.0.0
-
-asyncio
-aiofiles
-nest-asyncio
-tqdm>=4.66.0
+# 임시로 easyocr 제외 (런타임에 설치)
+# easyocr는 app.py에서 조건부 설치
