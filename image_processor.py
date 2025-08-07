@@ -1,420 +1,268 @@
 """
-Image Processor Module
-이미지 추출, 텍스트 감지, 이미지 수정을 담당하는 모듈
+Image Processor Module - 메모리 최적화 버전
+Streamlit Cloud용 경량 이미지 처리
 """
 
 import logging
 from typing import List, Dict, Tuple, Optional
 import io
+import gc
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
-import cv2
-import fitz  # PyMuPDF
-import easyocr
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-class ImageProcessor:
-    """이미지 처리 전문 클래스"""
+class LightweightImageProcessor:
+    """메모리 효율적인 이미지 처리기"""
     
-    def __init__(self, ocr_languages: List[str] = None):
+    def __init__(self, ocr_languages: List[str] = None, max_workers: int = 2):
         """
-        초기화
+        초기화 (최소한의 리소스 사용)
         
         Args:
-            ocr_languages: OCR에 사용할 언어 목록
+            ocr_languages: OCR 언어 목록
+            max_workers: 최대 워커 수 (메모리 절약을 위해 제한)
         """
         self.ocr_languages = ocr_languages or ['en']
         self.ocr_reader = None
-        self._init_ocr()
+        self.max_image_size = (1920, 1080)  # 최대 이미지 크기 제한
+        self.max_workers = min(max_workers, 2)  # 최대 2개로 제한
     
-    def _init_ocr(self):
-        """OCR 엔진 초기화"""
+    def init_ocr_lazy(self):
+        """OCR 엔진 지연 초기화 (필요할 때만)"""
+        if self.ocr_reader is not None:
+            return self.ocr_reader
+        
         try:
-            # 언어 코드 매핑
+            import easyocr
+            
+            # 언어 매핑
             lang_map = {
                 'ko': 'ko',
-                'en': 'en',
+                'en': 'en', 
                 'zh': 'ch_sim',
-                'zh-TW': 'ch_tra',
                 'ja': 'ja',
-                'de': 'de',
-                'fr': 'fr',
                 'es': 'es',
-                'ru': 'ru',
-                'ar': 'ar',
-                'th': 'th',
-                'vi': 'vi'
+                'fr': 'fr',
+                'de': 'de'
             }
             
-            # OCR 언어 설정
             ocr_langs = []
             for lang in self.ocr_languages:
-                mapped_lang = lang_map.get(lang, lang)
-                if mapped_lang not in ocr_langs:
-                    ocr_langs.append(mapped_lang)
+                mapped = lang_map.get(lang, lang)
+                if mapped not in ocr_langs:
+                    ocr_langs.append(mapped)
             
-            # GPU 사용 가능 여부 확인
-            gpu = self._check_gpu()
+            # CPU 모드로만 실행 (GPU 비활성화)
+            logger.info(f"EasyOCR 초기화: {ocr_langs} (CPU mode)")
+            self.ocr_reader = easyocr.Reader(ocr_langs, gpu=False)
             
-            logger.info(f"EasyOCR 초기화: languages={ocr_langs}, gpu={gpu}")
-            self.ocr_reader = easyocr.Reader(ocr_langs, gpu=gpu)
+            # 메모리 정리
+            gc.collect()
+            
+            return self.ocr_reader
             
         except Exception as e:
             logger.error(f"OCR 초기화 실패: {e}")
-            # 폴백: 영어만 사용
-            try:
-                self.ocr_reader = easyocr.Reader(['en'], gpu=False)
-            except:
-                logger.error("OCR 완전 실패")
-                self.ocr_reader = None
+            return None
     
-    def _check_gpu(self) -> bool:
-        """GPU 사용 가능 여부 확인"""
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except:
-            return False
+    def resize_image_if_needed(self, image: Image.Image) -> Image.Image:
+        """이미지 크기 제한 (메모리 절약)"""
+        if image.width > self.max_image_size[0] or image.height > self.max_image_size[1]:
+            image.thumbnail(self.max_image_size, Image.Resampling.LANCZOS)
+            logger.info(f"이미지 리사이즈: {image.size}")
+        return image
     
-    def extract_images_from_pdf(self, pdf_path: str) -> List[Dict]:
-        """
-        PDF에서 모든 이미지 추출
-        
-        Args:
-            pdf_path: PDF 파일 경로
-            
-        Returns:
-            이미지 정보 리스트
-        """
-        doc = fitz.open(pdf_path)
-        images = []
-        
-        for page_num, page in enumerate(doc):
-            page_images = self._extract_images_from_page(page, page_num)
-            images.extend(page_images)
-        
-        doc.close()
-        return images
-    
-    def _extract_images_from_page(self, page, page_num: int) -> List[Dict]:
-        """페이지에서 이미지 추출"""
+    def extract_images_from_pdf_page(self, page, page_num: int) -> List[Dict]:
+        """단일 페이지에서 이미지 추출 (메모리 효율적)"""
         images = []
         image_list = page.get_images()
         
         for img_index, img_info in enumerate(image_list):
+            if img_index >= 5:  # 페이지당 최대 5개 이미지만 처리
+                logger.warning(f"페이지 {page_num}: 이미지 수 제한 초과")
+                break
+            
             try:
+                import fitz
+                
                 # 이미지 추출
                 xref = img_info[0]
                 pix = fitz.Pixmap(page.parent, xref)
                 
-                # 이미지 메타데이터
-                img_rect = page.get_image_bbox(img_info)
+                # 알파 채널 제거
+                if pix.alpha:
+                    pix = fitz.Pixmap(pix, 0)
                 
                 # PIL 이미지로 변환
-                if pix.alpha:
-                    pix = fitz.Pixmap(pix, 0)  # 알파 채널 제거
-                img_data = pix.pil_tobytes(format="PNG")
+                img_data = pix.tobytes("png")
                 image = Image.open(io.BytesIO(img_data))
                 
-                # 이미지 정보 저장
+                # 크기 제한
+                image = self.resize_image_if_needed(image)
+                
+                # 메타데이터 저장
                 images.append({
                     'page': page_num,
                     'index': img_index,
                     'xref': xref,
-                    'bbox': img_rect,
                     'image': image,
-                    'width': image.width,
-                    'height': image.height
+                    'size': image.size
                 })
                 
-                pix = None  # 메모리 해제
+                # 즉시 메모리 해제
+                pix = None
+                del img_data
                 
             except Exception as e:
                 logger.error(f"이미지 추출 오류 (page {page_num}, img {img_index}): {e}")
                 continue
         
+        # 메모리 정리
+        gc.collect()
+        
         return images
     
     def detect_text_in_image(self, image: Image.Image, 
-                           enhance: bool = True,
                            confidence_threshold: float = 0.5) -> List[Dict]:
-        """
-        이미지에서 텍스트 감지
-        
-        Args:
-            image: PIL 이미지
-            enhance: 이미지 향상 여부
-            confidence_threshold: 신뢰도 임계값
-            
-        Returns:
-            감지된 텍스트 정보 리스트
-        """
-        if not self.ocr_reader:
-            logger.warning("OCR reader not initialized")
+        """이미지에서 텍스트 감지 (메모리 효율적)"""
+        # OCR 초기화 (지연 로딩)
+        reader = self.init_ocr_lazy()
+        if not reader:
             return []
         
-        # 이미지 전처리
-        if enhance:
-            image = self._enhance_image_for_ocr(image)
-        
-        # numpy 배열로 변환
-        img_array = np.array(image)
-        
-        # OCR 실행
         try:
-            results = self.ocr_reader.readtext(img_array)
+            # 이미지 전처리 (간단한 처리만)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # 크기 제한
+            image = self.resize_image_if_needed(image)
+            
+            # numpy 배열 변환
+            img_array = np.array(image)
+            
+            # OCR 실행
+            results = reader.readtext(img_array, batch_size=1)  # 배치 크기 제한
             
             texts = []
-            for (bbox, text, confidence) in results:
+            for bbox, text, confidence in results:
                 if confidence >= confidence_threshold:
-                    # 바운딩 박스를 표준 형식으로 변환
-                    x_coords = [p[0] for p in bbox]
-                    y_coords = [p[1] for p in bbox]
-                    
                     texts.append({
                         'bbox': bbox,
                         'text': text.strip(),
-                        'confidence': confidence,
-                        'x_min': min(x_coords),
-                        'x_max': max(x_coords),
-                        'y_min': min(y_coords),
-                        'y_max': max(y_coords),
-                        'center_x': sum(x_coords) / len(x_coords),
-                        'center_y': sum(y_coords) / len(y_coords)
+                        'confidence': confidence
                     })
             
-            logger.info(f"감지된 텍스트: {len(texts)}개")
+            # 메모리 해제
+            del img_array
+            gc.collect()
+            
+            logger.info(f"텍스트 감지: {len(texts)}개")
             return texts
             
         except Exception as e:
             logger.error(f"OCR 실행 오류: {e}")
             return []
     
-    def _enhance_image_for_ocr(self, image: Image.Image) -> Image.Image:
-        """OCR을 위한 이미지 향상"""
+    def create_text_overlay_simple(self, image: Image.Image,
+                                  texts: List[Dict],
+                                  font_size: int = 16) -> Image.Image:
+        """간단한 텍스트 오버레이 (메모리 효율적)"""
         try:
-            # 그레이스케일 변환
-            if image.mode != 'L':
-                image = image.convert('L')
+            # 이미지 복사
+            img_copy = image.copy()
             
-            # 대비 향상
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(1.5)
+            # RGB로 변환
+            if img_copy.mode != 'RGB':
+                img_copy = img_copy.convert('RGB')
             
-            # 선명도 향상
-            image = image.filter(ImageFilter.SHARPEN)
+            draw = ImageDraw.Draw(img_copy)
             
-            # 이진화 (선택적)
-            # threshold = 128
-            # image = image.point(lambda p: p > threshold and 255)
-            
-            return image
-            
-        except Exception as e:
-            logger.error(f"이미지 향상 오류: {e}")
-            return image
-    
-    def extract_images_with_text(self, pdf_path: str, 
-                                confidence_threshold: float = 0.5) -> List[Dict]:
-        """
-        PDF에서 텍스트가 포함된 이미지만 추출
-        
-        Args:
-            pdf_path: PDF 파일 경로
-            confidence_threshold: OCR 신뢰도 임계값
-            
-        Returns:
-            텍스트가 포함된 이미지 정보 리스트
-        """
-        # 모든 이미지 추출
-        all_images = self.extract_images_from_pdf(pdf_path)
-        
-        # 텍스트가 있는 이미지만 필터링
-        images_with_text = []
-        
-        for img_info in all_images:
-            # 텍스트 감지
-            texts = self.detect_text_in_image(
-                img_info['image'],
-                confidence_threshold=confidence_threshold
-            )
-            
-            if texts:
-                img_info['texts'] = texts
-                images_with_text.append(img_info)
-                logger.info(f"페이지 {img_info['page']}, 이미지 {img_info['index']}: {len(texts)}개 텍스트 감지")
-        
-        return images_with_text
-    
-    def create_text_overlay(self, image: Image.Image, 
-                          texts: List[Dict],
-                          font_path: Optional[str] = None,
-                          font_size: int = 20,
-                          text_color: Tuple[int, int, int] = (0, 0, 0),
-                          bg_color: Tuple[int, int, int, int] = (255, 255, 255, 200),
-                          preserve_layout: bool = True) -> Image.Image:
-        """
-        이미지에 텍스트 오버레이 생성
-        
-        Args:
-            image: 원본 이미지
-            texts: 텍스트 정보 리스트 (번역된 텍스트 포함)
-            font_path: 폰트 파일 경로
-            font_size: 폰트 크기
-            text_color: 텍스트 색상
-            bg_color: 배경 색상 (RGBA)
-            preserve_layout: 원본 레이아웃 유지 여부
-            
-        Returns:
-            텍스트가 오버레이된 이미지
-        """
-        # 이미지 복사
-        img_copy = image.copy()
-        
-        # RGBA로 변환
-        if img_copy.mode != 'RGBA':
-            img_copy = img_copy.convert('RGBA')
-        
-        # 오버레이 레이어 생성
-        overlay = Image.new('RGBA', img_copy.size, (255, 255, 255, 0))
-        draw_overlay = ImageDraw.Draw(overlay)
-        
-        # 폰트 로드
-        try:
-            if font_path and Path(font_path).exists():
-                font = ImageFont.truetype(font_path, size=font_size)
-            else:
-                font = ImageFont.load_default()
-        except:
-            font = ImageFont.load_default()
-        
-        # 각 텍스트 처리
-        for text_info in texts:
-            if preserve_layout:
-                # 원본 위치에 텍스트 배치
-                self._draw_text_at_position(
-                    draw_overlay, 
-                    text_info, 
-                    font, 
-                    text_color, 
-                    bg_color
-                )
-            else:
-                # 새로운 레이아웃으로 텍스트 배치
-                self._draw_text_new_layout(
-                    draw_overlay,
-                    text_info,
-                    font,
-                    text_color,
-                    bg_color
-                )
-        
-        # 오버레이 합성
-        result = Image.alpha_composite(img_copy, overlay)
-        
-        # RGB로 변환
-        if result.mode != 'RGB':
-            result = result.convert('RGB')
-        
-        return result
-    
-    def _draw_text_at_position(self, draw, text_info: Dict, font, 
-                              text_color, bg_color):
-        """원본 위치에 텍스트 그리기"""
-        # 번역된 텍스트 가져오기
-        translated_text = text_info.get('translated', text_info['text'])
-        
-        # 바운딩 박스
-        x_min = text_info['x_min']
-        x_max = text_info['x_max']
-        y_min = text_info['y_min']
-        y_max = text_info['y_max']
-        
-        # 배경 박스 그리기
-        draw.rectangle(
-            [(x_min, y_min), (x_max, y_max)],
-            fill=bg_color
-        )
-        
-        # 텍스트 그리기
-        draw.text(
-            (x_min, y_min),
-            translated_text,
-            fill=text_color,
-            font=font
-        )
-    
-    def _draw_text_new_layout(self, draw, text_info: Dict, font,
-                            text_color, bg_color):
-        """새로운 레이아웃으로 텍스트 배치"""
-        # 구현 필요: 텍스트를 새로운 레이아웃으로 재배치
-        self._draw_text_at_position(draw, text_info, font, text_color, bg_color)
-    
-    def replace_image_in_pdf(self, doc: fitz.Document, page_num: int, 
-                            xref: int, new_image: Image.Image) -> bool:
-        """
-        PDF 페이지의 이미지 교체 (수정된 PyMuPDF API 사용)
-        
-        Args:
-            doc: PDF 문서 객체
-            page_num: 페이지 번호
-            xref: 이미지 xref
-            new_image: 새 이미지
-            
-        Returns:
-            성공 여부
-        """
-        try:
-            # 이미지를 바이트로 변환
-            img_buffer = io.BytesIO()
-            new_image.save(img_buffer, format='PNG')
-            img_data = img_buffer.getvalue()
-            
-            # 이미지 스트림 업데이트 (올바른 PyMuPDF API)
-            doc.update_stream(xref, img_data)
-            
-            # 이미지 메타데이터 가져오기 및 업데이트
-            img_dict = doc.xref_object(xref)
-            
-            # 딕셔너리 문자열 파싱 및 수정
-            new_dict = img_dict.replace(
-                f"/Width {doc.xref_get_key(xref, 'Width')[1]}",
-                f"/Width {new_image.width}"
-            ).replace(
-                f"/Height {doc.xref_get_key(xref, 'Height')[1]}",  
-                f"/Height {new_image.height}"
-            )
-            
-            # 수정된 메타데이터 업데이트
-            doc.update_object(xref, new_dict)
-            
-            logger.info(f"이미지 교체 성공: xref={xref}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"이미지 교체 실패: {e}")
-            # 폴백: 페이지에 오버레이 추가
+            # 기본 폰트 사용
             try:
-                page = doc[page_num]
-                img_rect = page.get_image_bbox(xref)
+                font = ImageFont.load_default()
+            except:
+                font = None
+            
+            # 텍스트 그리기 (간단한 방식)
+            for text_info in texts:
+                translated = text_info.get('translated', text_info['text'])
+                bbox = text_info['bbox']
                 
-                # 이미지를 임시 파일로 저장
-                temp_img = io.BytesIO()
-                new_image.save(temp_img, format='PNG')
-                temp_img.seek(0)
+                # 바운딩 박스 좌표
+                x = int(bbox[0][0])
+                y = int(bbox[0][1])
                 
-                # 페이지에 이미지 삽입
-                page.insert_image(
-                    img_rect,
-                    stream=temp_img,
-                    overlay=True
+                # 배경 박스
+                draw.rectangle(
+                    [(x-2, y-2), (x+200, y+font_size+4)],
+                    fill=(255, 255, 255),
+                    outline=(0, 0, 0)
                 )
-                logger.info(f"이미지 오버레이로 대체: xref={xref}")
-                return True
                 
-            except Exception as e2:
-                logger.error(f"오버레이도 실패: {e2}")
-                return False
+                # 텍스트
+                draw.text(
+                    (x, y),
+                    translated[:50],  # 길이 제한
+                    fill=(0, 0, 0),
+                    font=font
+                )
+            
+            return img_copy
+            
+        except Exception as e:
+            logger.error(f"오버레이 생성 오류: {e}")
+            return image
+    
+    def cleanup(self):
+        """리소스 정리"""
+        self.ocr_reader = None
+        gc.collect()
+        logger.info("ImageProcessor 리소스 정리 완료")
+
+
+# 유틸리티 함수들
+def process_image_batch(images: List[Image.Image], 
+                        processor: LightweightImageProcessor,
+                        batch_size: int = 2) -> List[Dict]:
+    """이미지 배치 처리 (메모리 효율적)"""
+    results = []
+    
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i+batch_size]
+        
+        for image in batch:
+            texts = processor.detect_text_in_image(image)
+            results.append({
+                'image': image,
+                'texts': texts
+            })
+        
+        # 배치 처리 후 메모리 정리
+        gc.collect()
+    
+    return results
+
+
+def estimate_memory_usage(image: Image.Image) -> float:
+    """이미지 메모리 사용량 추정 (MB)"""
+    # RGB 이미지 기준: width * height * 3 bytes
+    bytes_used = image.width * image.height * 3
+    return bytes_used / (1024 * 1024)
+
+
+def check_memory_available(required_mb: float) -> bool:
+    """사용 가능한 메모리 확인"""
+    try:
+        import psutil
+        available = psutil.virtual_memory().available / (1024 * 1024)
+        return available > required_mb
+    except:
+        # psutil 없으면 항상 True
+        return True
+
+
+# 하위 호환성을 위한 별칭
+ImageProcessor = LightweightImageProcessor
