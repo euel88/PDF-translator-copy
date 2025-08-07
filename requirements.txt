@@ -1,18 +1,51 @@
-# Streamlit Cloud 호환 requirements.txt
-# Python 3.8-3.12 권장 (pdf2zh 호환성)
+# PDF GPT 번역기 - Streamlit Cloud 호환
+# Python 3.11 권장 (더 나은 호환성)
 
-# 핵심 패키지
-streamlit>=1.28.0
+# === 핵심 웹 프레임워크 ===
+streamlit>=1.28.0,<2.0.0
+gradio-pdf>=0.0.21
+
+# === AI/ML 번역 엔진 ===
 openai>=1.0.0
+# azure-ai-translation-text<=1.0.1
+
+# === PDF 처리 (순서 중요) ===
+# PyMuPDF 대신 더 가벼운 대안 사용
+pypdf>=3.17.0
 PyPDF2>=3.0.1
+# pymupdf는 시스템 의존성이 복잡하므로 제외
+# pdf2zh는 별도 설치
 
-# PDF 번역 (버전 명시)
-pdf2zh==1.9.11
+# === 이미지/비전 처리 ===
+# opencv-python-headless 대신 가벼운 버전
+Pillow>=10.0.0
+numpy>=1.24.0,<2.0.0
 
-# 추가 의존성 (pdf2zh 필수)
-pymupdf>=1.23.0
+# === 머신러닝 런타임 ===
+# CPU 전용 ONNX Runtime (GPU 버전은 너무 무거움)
+onnxruntime>=1.16.0
+onnx>=1.14.0
+
+# === 번역 관련 ===
+requests>=2.31.0
+tenacity>=8.2.0
+tqdm>=4.66.0
+
+# === 문서 처리 ===
+pdfminer.six==20231228
+fonttools>=4.43.0
 pikepdf>=8.0.0
-pillow>=10.0.0
 
-# 선택 패키지
+# === 데이터베이스 ===
+peewee>=3.17.0
+
+# === 클라우드 서비스 ===
+huggingface-hub>=0.19.0
+
+# === 유틸리티 ===
 python-dotenv>=1.0.0
+rich>=13.0.0
+
+# === 특수 패키지 (선택적) ===
+# pdf2zh를 직접 설치하는 대신 필요 컴포넌트만 설치
+# pdf2zh==1.9.11  # 복잡한 의존성으로 인해 주석 처리
