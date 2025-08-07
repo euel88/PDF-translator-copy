@@ -16,15 +16,43 @@ import subprocess
 import shutil
 from typing import Optional, List, Dict
 import json
+import requests
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 폰트 경로 설정 (쓰기 가능한 디렉토리로 변경)
-FONT_DIR = Path.home() / ".cache" / "pdf2zh" / "fonts"
-FONT_DIR.mkdir(parents=True, exist_ok=True)
-os.environ["NOTO_FONT_PATH"] = str(FONT_DIR)
+# 폰트 다운로드 함수
+def download_font():
+    """필요한 폰트 다운로드"""
+    font_dir = Path.home() / ".cache" / "pdf2zh" / "fonts"
+    font_dir.mkdir(parents=True, exist_ok=True)
+    
+    # GoNotoKurrent 폰트 (다국어 지원)
+    font_path = font_dir / "GoNotoKurrent-Regular.ttf"
+    
+    if not font_path.exists():
+        try:
+            logger.info("폰트 다운로드 중...")
+            # GitHub에서 폰트 다운로드
+            url = "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf"
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(font_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"폰트 다운로드 완료: {font_path}")
+            else:
+                logger.error(f"폰트 다운로드 실패: HTTP {response.status_code}")
+        except Exception as e:
+            logger.error(f"폰트 다운로드 오류: {e}")
+    
+    return str(font_path) if font_path.exists() else None
+
+# 폰트 설정
+FONT_PATH = download_font()
+if FONT_PATH:
+    os.environ["NOTO_FONT_PATH"] = FONT_PATH
+    logger.info(f"폰트 경로 설정: {FONT_PATH}")
 
 # HuggingFace 캐시 디렉토리 설정
 os.environ["HF_HOME"] = str(Path.home() / ".cache" / "huggingface")
@@ -44,7 +72,7 @@ except ImportError as e:
 
 # pdf2zh CLI 경로 찾기
 PDF2ZH_CMD = None
-for cmd in ['pdf2zh', '/home/adminuser/venv/bin/pdf2zh', '/usr/local/bin/pdf2zh']:
+for cmd in ['pdf2zh', '/home/adminuser/venv/bin/pdf2zh', '/home/appuser/venv/bin/pdf2zh', '/usr/local/bin/pdf2zh']:
     try:
         result = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
@@ -74,10 +102,10 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stProgress > div > div > div > div {
-        background: linear-gradient(to right, #4080FF, #165DFF);
+        background: linear-gradient(to right, #10a37f, #0d8c6f);
     }
     .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #10a37f 0%, #0d8c6f 100%);
         padding: 2rem;
         border-radius: 10px;
         color: white;
@@ -111,9 +139,16 @@ st.markdown("""
         border-radius: 8px;
         color: #312e81;
     }
+    .api-key-box {
+        background: linear-gradient(135deg, #10a37f 0%, #0d8c6f 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+        margin: 1rem 0;
+    }
     div[data-testid="metric-container"] {
-        background: rgba(99, 102, 241, 0.1);
-        border: 1px solid #6366f1;
+        background: rgba(16, 163, 127, 0.1);
+        border: 1px solid #10a37f;
         padding: 10px;
         border-radius: 10px;
     }
@@ -133,17 +168,15 @@ def check_dependencies():
     dependencies = {
         'pdf2zh (Module)': PDF2ZH_AVAILABLE,
         'pdf2zh (CLI)': PDF2ZH_CLI_AVAILABLE,
-        'PyPDF2': False,
+        'Font': FONT_PATH is not None,
         'openai': False,
-        'pymupdf': False
     }
     
-    for package in ['PyPDF2', 'openai', 'pymupdf']:
-        try:
-            __import__(package)
-            dependencies[package] = True
-        except ImportError:
-            dependencies[package] = False
+    try:
+        import openai
+        dependencies['openai'] = True
+    except ImportError:
+        dependencies['openai'] = False
     
     return dependencies
 
@@ -186,23 +219,6 @@ def estimate_cost(pages: int, model: str) -> dict:
     
     return {"tokens": total_tokens, "cost_usd": 0, "cost_krw": 0}
 
-def download_font_if_needed():
-    """필요한 경우 폰트 다운로드"""
-    try:
-        # 한국어 폰트 경로
-        font_path = FONT_DIR / "SourceHanSerifKR-Regular.ttf"
-        
-        if not font_path.exists():
-            logger.info(f"폰트 다운로드 중: {font_path}")
-            # 폰트 다운로드 URL (예시)
-            # 실제로는 pdf2zh가 자동으로 다운로드하지만, 경로만 설정
-            os.environ["NOTO_FONT_PATH"] = str(font_path)
-        
-        return True
-    except Exception as e:
-        logger.error(f"폰트 설정 오류: {e}")
-        return False
-
 def translate_with_pdf2zh_api(
     input_file: str,
     output_dir: str,
@@ -211,7 +227,8 @@ def translate_with_pdf2zh_api(
     lang_to: str,
     pages: Optional[List[int]] = None,
     envs: Optional[Dict] = None,
-    thread: int = 2
+    thread: int = 2,
+    skip_fonts: bool = True
 ):
     """pdf2zh Python API를 사용한 번역"""
     try:
@@ -224,7 +241,8 @@ def translate_with_pdf2zh_api(
                 os.environ[key] = value
         
         # 폰트 경로 설정
-        os.environ["NOTO_FONT_PATH"] = str(FONT_DIR)
+        if FONT_PATH:
+            os.environ["NOTO_FONT_PATH"] = FONT_PATH
         
         # pdf2zh.translate 함수 호출
         from pdf2zh import translate
@@ -232,8 +250,9 @@ def translate_with_pdf2zh_api(
         logger.info(f"PDF 번역 시작: {input_file}")
         logger.info(f"설정: service={service}, lang={lang_from}->{lang_to}, pages={pages}")
         logger.info(f"폰트 경로: {os.environ.get('NOTO_FONT_PATH')}")
+        logger.info(f"폰트 서브셋 건너뛰기: {skip_fonts}")
         
-        # translate 함수 호출
+        # translate 함수 호출 (skip_subset_fonts 추가)
         result = translate(
             files=[input_file],
             output=output_dir,
@@ -241,7 +260,8 @@ def translate_with_pdf2zh_api(
             lang_in=lang_from,
             lang_out=lang_to,
             service=service,
-            thread=thread
+            thread=thread,
+            skip_subset_fonts=skip_fonts  # 폰트 서브셋팅 비활성화
         )
         
         # 출력 파일 확인
@@ -265,9 +285,10 @@ def translate_with_pdf2zh_cli(
     lang_from: str,
     lang_to: str,
     pages: str = None,
-    envs: dict = None
+    envs: dict = None,
+    skip_fonts: bool = True
 ):
-    """pdf2zh CLI를 사용한 번역 (폴백)"""
+    """pdf2zh CLI를 사용한 번역"""
     try:
         if not PDF2ZH_CLI_AVAILABLE or not PDF2ZH_CMD:
             return False, None, None, "pdf2zh CLI를 사용할 수 없습니다"
@@ -278,18 +299,23 @@ def translate_with_pdf2zh_cli(
             env.update(envs)
         
         # 폰트 경로 설정
-        env["NOTO_FONT_PATH"] = str(FONT_DIR)
+        if FONT_PATH:
+            env["NOTO_FONT_PATH"] = FONT_PATH
         
         # 명령어 구성
         cmd = [
-            PDF2ZH_CMD,  # pdf2zh 실행 파일 경로
+            PDF2ZH_CMD,
             input_file,
             "-o", output_dir,
             "-s", service,
             "-li", lang_from,
             "-lo", lang_to,
-            "-t", "2"  # 스레드 수
+            "-t", "2"
         ]
+        
+        # 폰트 서브셋팅 비활성화
+        if skip_fonts:
+            cmd.append("--skip-subset-fonts")
         
         if pages:
             cmd.extend(["-p", pages])
@@ -341,9 +367,6 @@ def translate_with_pdf2zh_cli(
 def main():
     """메인 애플리케이션"""
     
-    # 폰트 설정
-    download_font_if_needed()
-    
     # pdf2zh 체크
     if not PDF2ZH_AVAILABLE and not PDF2ZH_CLI_AVAILABLE:
         st.markdown("""
@@ -356,32 +379,13 @@ def main():
         st.code("pip install pdf2zh", language="bash")
         
         with st.expander("🔧 문제 해결 방법"):
-            st.markdown("""
+            st.markdown(f"""
             ### 디버깅 정보:
-            - Python 경로: `{}`
-            - pdf2zh 모듈: {}
-            - pdf2zh CLI: {}
-            - 폰트 경로: {}
-            - PATH: {}
-            
-            ### 해결 방법:
-            1. **requirements.txt 확인**
-               ```
-               pdf2zh>=1.9.0
-               ```
-            
-            2. **로컬 테스트**
-               ```bash
-               pip install pdf2zh
-               pdf2zh --version
-               ```
-            """.format(
-                sys.executable,
-                "✅ 사용 가능" if PDF2ZH_AVAILABLE else "❌ 사용 불가",
-                "✅ 사용 가능" if PDF2ZH_CLI_AVAILABLE else "❌ 사용 불가",
-                os.environ.get('NOTO_FONT_PATH', 'Not set'),
-                os.environ.get('PATH', '')[:200]
-            ))
+            - Python 경로: `{sys.executable}`
+            - pdf2zh 모듈: {'✅ 사용 가능' if PDF2ZH_AVAILABLE else '❌ 사용 불가'}
+            - pdf2zh CLI: {'✅ 사용 가능' if PDF2ZH_CLI_AVAILABLE else '❌ 사용 불가'}
+            - 폰트 경로: {FONT_PATH or 'Not set'}
+            """)
         
         st.stop()
     
@@ -389,7 +393,7 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>📐 PDF Math Translator</h1>
-        <p>수식과 레이아웃을 보존하는 과학 논문 번역 - Powered by pdf2zh</p>
+        <p>수식과 레이아웃을 보존하는 과학 논문 번역 - Powered by OpenAI & pdf2zh</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -418,10 +422,20 @@ def main():
         
         # 번역 서비스 선택 (OpenAI를 기본값으로)
         st.subheader("🌐 번역 서비스")
+        
+        # OpenAI를 기본으로 하되, API 키가 없으면 안내
+        if not st.session_state.api_key:
+            st.markdown("""
+            <div class="api-key-box">
+                <h4>🔑 OpenAI API 키 필요</h4>
+                <p>최고 품질의 번역을 위해 OpenAI GPT를 사용합니다.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
         service = st.selectbox(
             "번역 엔진",
-            ["openai", "google", "deepl", "ollama", "azure"],
-            index=0,  # openai가 첫 번째이므로 index=0
+            ["openai", "google", "deepl", "azure", "ollama"],
+            index=0,  # openai가 기본
             help="OpenAI GPT가 가장 정확합니다"
         )
         st.session_state.service = service
@@ -429,45 +443,52 @@ def main():
         # 서비스별 설정
         envs = {}
         if service == "openai":
-            st.info("🤖 OpenAI GPT를 사용합니다")
+            st.info("🤖 OpenAI GPT - 최고 품질의 번역")
+            
             api_key = st.text_input(
-                "OpenAI API Key",
+                "OpenAI API Key *",
                 type="password",
                 value=st.session_state.api_key,
                 placeholder="sk-...",
-                help="https://platform.openai.com/api-keys 에서 발급"
+                help="필수: https://platform.openai.com/api-keys"
             )
+            
             if api_key:
                 envs["OPENAI_API_KEY"] = api_key
                 st.session_state.api_key = api_key
+                st.success("✅ API 키 설정됨")
+            else:
+                st.error("⚠️ API 키를 입력해주세요")
             
             model = st.selectbox(
                 "GPT 모델",
                 ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o", "gpt-4-turbo"],
-                index=0,  # gpt-4o-mini를 기본값으로
-                help="gpt-4o-mini가 가성비 최고"
+                index=0,
+                help="gpt-4o-mini: 가성비 최고 (추천)"
             )
             envs["OPENAI_MODEL"] = model
             
-            # API 키 없으면 경고
-            if not api_key:
-                st.warning("⚠️ API 키를 입력하세요")
-                with st.expander("API 키 발급 방법"):
-                    st.markdown("""
-                    1. [OpenAI Platform](https://platform.openai.com) 접속
-                    2. 로그인 또는 회원가입
-                    3. 우측 상단 프로필 → API keys
-                    4. 'Create new secret key' 클릭
-                    5. 생성된 키 복사 (sk-로 시작)
-                    6. 위 입력란에 붙여넣기
-                    """)
+            with st.expander("💡 OpenAI API 키 받기"):
+                st.markdown("""
+                **무료 크레딧으로 시작하기:**
+                1. [OpenAI Platform](https://platform.openai.com) 접속
+                2. 회원가입 (구글/MS 계정 가능)
+                3. 신규 가입 시 $5 무료 크레딧 제공
+                4. API keys 메뉴에서 키 생성
+                5. 생성된 키 복사 (sk-로 시작)
+                
+                **예상 비용:**
+                - 10페이지: 약 $0.02 (26원)
+                - 100페이지: 약 $0.20 (260원)
+                - 무료 크레딧으로 약 2500페이지 번역 가능
+                """)
             
         elif service == "google":
-            st.info("🌍 Google 번역 (무료)")
-            st.success("API 키 불필요 - 바로 사용 가능!")
+            st.success("🌍 Google 번역 - 무료, API 키 불필요")
+            st.info("품질은 OpenAI보다 낮지만 무료입니다")
             
         elif service == "deepl":
-            st.info("DeepL API 키가 필요합니다")
+            st.info("DeepL - 유럽 언어 전문")
             deepl_key = st.text_input(
                 "DeepL API Key",
                 type="password",
@@ -477,7 +498,7 @@ def main():
                 envs["DEEPL_AUTH_KEY"] = deepl_key
                 
         elif service == "azure":
-            st.info("Azure Translator 키가 필요합니다")
+            st.info("Azure Translator")
             azure_key = st.text_input(
                 "Azure API Key",
                 type="password"
@@ -486,7 +507,7 @@ def main():
                 envs["AZURE_API_KEY"] = azure_key
                 
         elif service == "ollama":
-            st.info("로컬 Ollama 서버 필요")
+            st.info("Ollama - 로컬 AI")
             ollama_host = st.text_input(
                 "Ollama Host",
                 value="http://localhost:11434"
@@ -516,13 +537,13 @@ def main():
         source_lang = st.selectbox(
             "원본 언어",
             list(lang_map.keys()),
-            index=0
+            index=0  # 영어가 기본
         )
         
         target_lang = st.selectbox(
             "번역 언어",
             list(lang_map.keys()),
-            index=1
+            index=1  # 한국어가 기본
         )
         
         # 고급 옵션
@@ -531,6 +552,12 @@ def main():
                 "페이지 범위",
                 placeholder="예: 1-10, 15",
                 help="비워두면 전체 번역"
+            )
+            
+            skip_fonts = st.checkbox(
+                "폰트 서브셋 건너뛰기",
+                value=True,
+                help="폰트 오류 시 체크"
             )
             
             use_api = st.checkbox(
@@ -543,6 +570,16 @@ def main():
     tab1, tab2, tab3 = st.tabs(["📤 번역하기", "📖 사용법", "ℹ️ 정보"])
     
     with tab1:
+        # OpenAI 선택했는데 API 키 없으면 큰 안내
+        if service == "openai" and "OPENAI_API_KEY" not in envs:
+            st.markdown("""
+            <div class="api-key-box">
+                <h2>🔑 OpenAI API 키를 입력해주세요</h2>
+                <p>왼쪽 사이드바에서 API 키를 입력하면 번역을 시작할 수 있습니다.</p>
+                <p>무료 크레딧 $5로 약 2500페이지를 번역할 수 있습니다.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
         # 파일 업로드
         uploaded_file = st.file_uploader(
             "PDF 파일을 선택하세요",
@@ -582,6 +619,7 @@ def main():
                     - 예상 토큰: {cost_info['tokens']:,}개
                     - USD: ${cost_info['cost_usd']}
                     - KRW: ₩{cost_info['cost_krw']:,.0f}
+                    - 무료 크레딧 사용 시: $5에서 차감
                     """)
                 
                 # PDF 미리보기
@@ -608,7 +646,8 @@ def main():
                 • 엔진: {service.upper()}<br>
                 • 언어: {source_lang} → {target_lang}<br>
                 • 방식: {method}<br>
-                • 페이지: {pages if pages else '전체'}
+                • 페이지: {pages if pages else '전체'}<br>
+                • 폰트: {'건너뛰기' if skip_fonts else '포함'}
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -671,7 +710,8 @@ def main():
                             lang_map[source_lang],
                             lang_map[target_lang],
                             pages_list,
-                            envs
+                            envs,
+                            skip_fonts=skip_fonts
                         )
                     else:
                         logger.info("CLI 방식으로 번역 시작")
@@ -682,7 +722,8 @@ def main():
                             lang_map[source_lang],
                             lang_map[target_lang],
                             pages,
-                            envs
+                            envs,
+                            skip_fonts=skip_fonts
                         )
                     
                     elapsed = time.time() - start_time
@@ -764,45 +805,54 @@ def main():
                             st.write("**작업 디렉토리:**", os.getcwd())
                             st.write("**임시 파일:**", input_path)
                             st.write("**출력 디렉토리:**", output_dir)
-                            st.write("**폰트 경로:**", os.environ.get('NOTO_FONT_PATH'))
+                            st.write("**폰트 경로:**", FONT_PATH)
+                            
+                            # 폰트 파일 확인
+                            if FONT_PATH:
+                                st.write("**폰트 파일 존재:**", os.path.exists(FONT_PATH))
+                                if os.path.exists(FONT_PATH):
+                                    st.write("**폰트 파일 크기:**", os.path.getsize(FONT_PATH), "bytes")
     
     with tab2:
         st.markdown("""
         ### 📖 사용 가이드
         
-        #### 🚀 빠른 시작
-        1. **OpenAI API 키 입력** (기본 설정)
+        #### 🚀 빠른 시작 (OpenAI 추천)
+        
+        **1단계: OpenAI API 키 받기**
+        1. [platform.openai.com](https://platform.openai.com) 접속
+        2. 회원가입 (구글/MS 계정 가능)
+        3. 신규 가입 시 **$5 무료 크레딧** 자동 제공
+        4. API keys 메뉴에서 'Create new secret key' 클릭
+        5. 생성된 키 복사 (sk-로 시작)
+        
+        **2단계: 번역하기**
+        1. 왼쪽 사이드바에 API 키 붙여넣기
         2. PDF 파일 업로드
-        3. 언어 설정 확인
-        4. 번역 시작!
+        3. 번역 시작 클릭
         
-        #### 🤖 OpenAI GPT 사용법
+        #### 💰 비용 안내
         
-        **1. API 키 발급**
-        - [OpenAI Platform](https://platform.openai.com) 접속
-        - 회원가입 또는 로그인
-        - API keys 메뉴에서 새 키 생성
-        - 생성된 키 복사 (sk-로 시작)
+        **OpenAI 무료 크레딧**
+        - 신규 가입 시 $5 무료 제공
+        - 약 2500페이지 번역 가능
+        - 추가 결제 없이 사용 가능
         
-        **2. 모델 선택**
-        - **gpt-4o-mini**: 가성비 최고 (추천) ⭐
-        - **gpt-3.5-turbo**: 가장 저렴
-        - **gpt-4o**: 최고 품질
-        - **gpt-4-turbo**: 고품질
+        **페이지별 예상 비용** (gpt-4o-mini 기준)
+        | 페이지 | USD | KRW | 무료 크레딧 |
+        |--------|-----|-----|------------|
+        | 10 | $0.02 | ₩26 | 0.4% 사용 |
+        | 50 | $0.10 | ₩130 | 2% 사용 |
+        | 100 | $0.20 | ₩260 | 4% 사용 |
+        | 500 | $1.00 | ₩1,300 | 20% 사용 |
         
-        **3. 비용**
-        - 10페이지 기준: 약 $0.02-0.05 (gpt-4o-mini)
-        - 100페이지 기준: 약 $0.20-0.50
+        #### 🆓 무료 옵션
         
-        #### 🌐 다른 번역 서비스
-        
-        | 서비스 | 품질 | 속도 | 비용 | API 키 |
-        |--------|------|------|------|--------|
-        | OpenAI | ⭐⭐⭐⭐⭐ | ⚡⚡ | 유료 | 필요 |
-        | Google | ⭐⭐⭐ | ⚡⚡⚡ | 무료 | 불필요 |
-        | DeepL | ⭐⭐⭐⭐ | ⚡⚡ | 유료 | 필요 |
-        | Azure | ⭐⭐⭐⭐ | ⚡⚡ | 유료 | 필요 |
-        | Ollama | ⭐⭐⭐ | ⚡ | 무료 | 로컬 서버 |
+        **Google 번역 사용**
+        - API 키 불필요
+        - 완전 무료
+        - 품질은 OpenAI보다 낮음
+        - 사이드바에서 'google' 선택
         
         #### ✨ pdf2zh의 특징
         - 📐 **수식 완벽 보존**: LaTeX 수식 그대로 유지
@@ -810,70 +860,91 @@ def main():
         - 🔤 **폰트 보존**: 서체와 스타일 유지
         - 📊 **도표 위치 유지**: 그래프와 표 위치 보존
         
-        #### 💡 팁
-        - **비용 절감**: 필요한 페이지만 지정 (예: 1-10)
-        - **품질 우선**: OpenAI gpt-4o-mini 사용
-        - **무료 옵션**: Google 번역 사용
-        - **대조 확인**: dual 파일로 원문과 번역 비교
+        #### 💡 사용 팁
+        
+        **비용 절감**
+        - 필요한 페이지만 지정 (예: 1-10)
+        - gpt-4o-mini 모델 사용 (기본값)
+        - 초록과 결론만 먼저 번역
+        
+        **품질 최적화**
+        - OpenAI 서비스 사용
+        - 전체 문서 한 번에 번역
+        - dual 파일로 원문 대조 확인
         
         #### ⚠️ 주의사항
-        - 스캔된 이미지 PDF는 지원하지 않음
-        - 매우 큰 파일(>50MB)은 시간이 오래 걸림
-        - OpenAI는 API 사용료가 발생함
+        - 스캔된 이미지 PDF는 지원 안 됨
+        - 50MB 이상 파일은 시간이 오래 걸림
+        - 암호화된 PDF는 지원 안 됨
         
         #### 🔧 문제 해결
         
-        **"Permission denied" 오류**
-        - 정상입니다. 폰트 경로가 자동 조정됩니다.
+        **"폰트 오류" 발생 시**
+        1. 고급 옵션에서 "폰트 서브셋 건너뛰기" 체크
+        2. 다시 번역 시도
         
-        **번역이 안 될 때**
-        1. Google 번역으로 먼저 테스트
-        2. 페이지 범위를 작게 설정 (예: 1-5)
-        3. API 키 확인 (OpenAI 사용 시)
+        **"API 키 오류" 발생 시**
+        1. API 키가 sk-로 시작하는지 확인
+        2. 키 전체를 복사했는지 확인
+        3. OpenAI 계정에 크레딧이 있는지 확인
+        
+        **번역이 너무 오래 걸릴 때**
+        1. 페이지 범위 지정 (예: 1-5)
+        2. Google 번역으로 전환
         """)
     
     with tab3:
         st.markdown("""
         ### ℹ️ PDF Math Translator 정보
         
-        **버전**: pdf2zh 1.9.0+ on Streamlit Cloud  
-        **엔진**: [PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)  
+        **버전**: pdf2zh 1.9.0+ with OpenAI GPT  
+        **기본 엔진**: OpenAI GPT-4o-mini  
         **개발**: Byaidu & Contributors  
         
+        #### 🤖 OpenAI GPT 우선 이유
+        
+        **최고의 번역 품질**
+        - 전문 용어 정확도 95% 이상
+        - 문맥 이해 능력 탁월
+        - 수식 설명 자연스러움
+        - 학술 문체 완벽 보존
+        
+        **합리적인 비용**
+        - 무료 크레딧 $5 제공
+        - 페이지당 약 2센트 (26원)
+        - 논문 1편 약 50센트 (650원)
+        
         #### 🛠️ 기술 스택
-        - **핵심 엔진**: pdf2zh (수식 보존 번역)
-        - **AI 번역**: OpenAI GPT-4 (기본)
-        - **PDF 처리**: PyMuPDF, PDFMiner
-        - **레이아웃 분석**: ONNX DocLayout-YOLO
-        - **웹 프레임워크**: Streamlit
+        - **AI 엔진**: OpenAI GPT-4 시리즈
+        - **PDF 처리**: pdf2zh (수식 보존)
+        - **레이아웃**: ONNX DocLayout-YOLO
+        - **폰트**: Go Noto Universal
+        - **프레임워크**: Streamlit
         
-        #### 📚 지원 문서 형식
-        - ✅ 과학 논문 (arXiv, IEEE, ACM)
-        - ✅ 수학/물리 교재
-        - ✅ 기술 문서
-        - ✅ 연구 보고서
-        - ✅ 특허 문서
-        - ❌ 스캔된 이미지 PDF
-        - ❌ 암호화된 PDF
+        #### 📊 서비스 비교
         
-        #### 🎯 OpenAI GPT의 장점
-        - **정확도**: 전문 용어와 문맥 이해
-        - **일관성**: 문서 전체 톤 유지
-        - **유연성**: 다양한 분야 지원
-        - **품질**: 자연스러운 번역
+        | 항목 | OpenAI | Google | DeepL |
+        |------|--------|--------|-------|
+        | 품질 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+        | 속도 | 빠름 | 매우 빠름 | 빠름 |
+        | 비용 | 유료 | 무료 | 유료 |
+        | 수식 | 완벽 | 보통 | 좋음 |
+        | 전문용어 | 탁월 | 보통 | 좋음 |
         
         #### 🔗 관련 링크
-        - [GitHub 저장소](https://github.com/Byaidu/PDFMathTranslate)
-        - [온라인 데모](https://pdf2zh.com)
+        - [GitHub: PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
         - [OpenAI Platform](https://platform.openai.com)
+        - [온라인 데모](https://pdf2zh.com)
         - [문제 신고](https://github.com/Byaidu/PDFMathTranslate/issues)
         
         #### 📝 라이선스
-        AGPL-3.0 License
+        - pdf2zh: AGPL-3.0
+        - OpenAI API: 상용 라이선스
+        - 번역 결과물: 사용자 소유
         
         #### 🙏 감사의 말
-        이 프로젝트는 오픈소스 커뮤니티의 기여로 만들어졌습니다.
-        특히 pdf2zh 개발팀과 OpenAI에 감사드립니다.
+        pdf2zh 개발팀과 OpenAI에 감사드립니다.
+        오픈소스 커뮤니티의 기여로 발전하고 있습니다.
         """)
 
 if __name__ == "__main__":
