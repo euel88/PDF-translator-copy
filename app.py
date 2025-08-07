@@ -1,6 +1,7 @@
 """
 PDF 번역기 - pdf2zh 기반 Streamlit Cloud 버전
 수식과 레이아웃을 보존하는 고품질 PDF 번역
+이미지 내 텍스트 번역 기능 포함
 """
 
 import streamlit as st
@@ -21,6 +22,11 @@ import requests
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 커스텀 모듈 import
+from pdf_ocr_translator import PDFOCRTranslator
+from image_processor import ImageProcessor
+from config import TranslationConfig
 
 # 폰트 다운로드 함수
 def download_font():
@@ -46,6 +52,19 @@ def download_font():
         except Exception as e:
             logger.error(f"폰트 다운로드 오류: {e}")
     
+    # 한글 폰트 추가 다운로드 (이미지 번역용)
+    korean_font_path = font_dir / "NanumGothic.ttf"
+    if not korean_font_path.exists():
+        try:
+            url = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(korean_font_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"한글 폰트 다운로드 완료: {korean_font_path}")
+        except Exception as e:
+            logger.error(f"한글 폰트 다운로드 오류: {e}")
+    
     return str(font_path) if font_path.exists() else None
 
 # 폰트 설정
@@ -70,7 +89,7 @@ try:
     PDF2ZH_AVAILABLE = True
     logger.info("✅ pdf2zh 모듈 로드 성공")
     
-    # ONNX 모델 초기화 - 이 부분이 중요!
+    # ONNX 모델 초기화
     try:
         logger.info("ONNX 모델 로드 중...")
         ModelInstance.value = OnnxModel.from_pretrained()
@@ -78,7 +97,6 @@ try:
         logger.info("✅ ONNX 모델 로드 성공")
     except Exception as e:
         logger.error(f"❌ ONNX 모델 로드 실패: {e}")
-        # 모델 로드 실패 시 대체 경로 시도
         try:
             logger.info("대체 모델 로드 시도...")
             from pdf2zh.doclayout import DocLayoutModel
@@ -113,7 +131,7 @@ st.sidebar.caption(f"Python {python_version.major}.{python_version.minor}.{pytho
 
 # 페이지 설정
 st.set_page_config(
-    page_title="PDF Math Translator - pdf2zh",
+    page_title="PDF Math Translator Pro - pdf2zh + OCR",
     page_icon="📐",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -126,7 +144,7 @@ st.markdown("""
         background: linear-gradient(to right, #10a37f, #0d8c6f);
     }
     .main-header {
-        background: linear-gradient(135deg, #10a37f 0%, #0d8c6f 100%);
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 2rem;
         border-radius: 10px;
         color: white;
@@ -161,15 +179,22 @@ st.markdown("""
         color: #312e81;
     }
     .api-key-box {
-        background: linear-gradient(135deg, #10a37f 0%, #0d8c6f 100%);
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1.5rem;
         border-radius: 10px;
         color: white;
         margin: 1rem 0;
     }
+    .ocr-box {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        padding: 1rem;
+        border-radius: 8px;
+        color: white;
+        margin: 1rem 0;
+    }
     div[data-testid="metric-container"] {
-        background: rgba(16, 163, 127, 0.1);
-        border: 1px solid #10a37f;
+        background: rgba(102, 126, 234, 0.1);
+        border: 1px solid #667eea;
         padding: 10px;
         border-radius: 10px;
     }
@@ -182,7 +207,9 @@ if 'api_key' not in st.session_state:
 if 'translation_history' not in st.session_state:
     st.session_state.translation_history = []
 if 'service' not in st.session_state:
-    st.session_state.service = "openai"  # 기본값을 openai로 설정
+    st.session_state.service = "openai"
+if 'ocr_enabled' not in st.session_state:
+    st.session_state.ocr_enabled = False
 
 def check_dependencies():
     """필수 패키지 확인"""
@@ -192,6 +219,8 @@ def check_dependencies():
         'ONNX Model': MODEL_INSTANCE is not None,
         'Font': FONT_PATH is not None,
         'openai': False,
+        'OCR (EasyOCR)': False,
+        'Image Processing': False,
     }
     
     try:
@@ -199,6 +228,19 @@ def check_dependencies():
         dependencies['openai'] = True
     except ImportError:
         dependencies['openai'] = False
+    
+    try:
+        import easyocr
+        dependencies['OCR (EasyOCR)'] = True
+    except ImportError:
+        dependencies['OCR (EasyOCR)'] = False
+    
+    try:
+        from PIL import Image
+        import cv2
+        dependencies['Image Processing'] = True
+    except ImportError:
+        dependencies['Image Processing'] = False
     
     return dependencies
 
@@ -215,9 +257,11 @@ def get_pdf_page_count(file_content):
         logger.error(f"PDF 페이지 수 확인 오류: {e}")
         return 0
 
-def estimate_cost(pages: int, model: str) -> dict:
+def estimate_cost(pages: int, model: str, with_ocr: bool = False) -> dict:
     """OpenAI API 비용 추정"""
     tokens_per_page = 1500
+    if with_ocr:
+        tokens_per_page *= 1.5  # OCR 사용 시 추가 토큰
     total_tokens = pages * tokens_per_page
     
     prices = {
@@ -241,6 +285,57 @@ def estimate_cost(pages: int, model: str) -> dict:
     
     return {"tokens": total_tokens, "cost_usd": 0, "cost_krw": 0}
 
+def translate_with_ocr(
+    input_file: str,
+    output_dir: str,
+    service: str,
+    lang_from: str,
+    lang_to: str,
+    pages: Optional[List[int]] = None,
+    envs: Optional[Dict] = None,
+    ocr_settings: Optional[Dict] = None,
+    progress_callback=None
+):
+    """OCR을 포함한 PDF 번역"""
+    try:
+        # 설정 초기화
+        config = TranslationConfig(
+            service=service,
+            lang_from=lang_from,
+            lang_to=lang_to,
+            api_key=envs.get("OPENAI_API_KEY") if service == "openai" else None,
+            model=envs.get("OPENAI_MODEL", "gpt-4o-mini") if service == "openai" else None
+        )
+        
+        # OCR 설정
+        if ocr_settings is None:
+            ocr_settings = {
+                'enable_ocr': True,
+                'ocr_languages': [lang_from],
+                'replace_images': True,
+                'overlay_text': True,
+                'preserve_layout': True
+            }
+        
+        config.ocr_settings = ocr_settings
+        
+        # PDFOCRTranslator 인스턴스 생성
+        translator = PDFOCRTranslator(config)
+        
+        # 번역 실행
+        output_files = translator.translate_pdf(
+            input_file,
+            output_dir,
+            pages=pages,
+            progress_callback=progress_callback
+        )
+        
+        return True, output_files['mono'], output_files['dual'], "번역 완료 (OCR 포함)"
+        
+    except Exception as e:
+        logger.error(f"OCR 번역 오류: {e}", exc_info=True)
+        return False, None, None, str(e)
+
 def translate_with_pdf2zh_api(
     input_file: str,
     output_dir: str,
@@ -252,7 +347,7 @@ def translate_with_pdf2zh_api(
     thread: int = 2,
     skip_fonts: bool = True
 ):
-    """pdf2zh Python API를 사용한 번역"""
+    """기존 pdf2zh Python API를 사용한 번역"""
     try:
         if not PDF2ZH_AVAILABLE:
             return False, None, None, "pdf2zh 모듈을 사용할 수 없습니다"
@@ -274,11 +369,8 @@ def translate_with_pdf2zh_api(
         
         logger.info(f"PDF 번역 시작: {input_file}")
         logger.info(f"설정: service={service}, lang={lang_from}->{lang_to}, pages={pages}")
-        logger.info(f"폰트 경로: {os.environ.get('NOTO_FONT_PATH')}")
-        logger.info(f"폰트 서브셋 건너뛰기: {skip_fonts}")
-        logger.info(f"ONNX 모델: {MODEL_INSTANCE}")
         
-        # translate 함수 호출 (model 파라미터 추가!)
+        # translate 함수 호출
         result = translate(
             files=[input_file],
             output=output_dir,
@@ -288,7 +380,7 @@ def translate_with_pdf2zh_api(
             service=service,
             thread=thread,
             skip_subset_fonts=skip_fonts,
-            model=MODEL_INSTANCE  # 모델 파라미터 추가
+            model=MODEL_INSTANCE
         )
         
         # 출력 파일 확인
@@ -305,144 +397,15 @@ def translate_with_pdf2zh_api(
         logger.error(f"pdf2zh API 오류: {e}", exc_info=True)
         return False, None, None, str(e)
 
-def translate_with_pdf2zh_cli(
-    input_file: str,
-    output_dir: str,
-    service: str,
-    lang_from: str,
-    lang_to: str,
-    pages: str = None,
-    envs: dict = None,
-    skip_fonts: bool = True
-):
-    """pdf2zh CLI를 사용한 번역"""
-    try:
-        if not PDF2ZH_CLI_AVAILABLE or not PDF2ZH_CMD:
-            return False, None, None, "pdf2zh CLI를 사용할 수 없습니다"
-        
-        # 환경 변수 설정
-        env = os.environ.copy()
-        if envs:
-            env.update(envs)
-        
-        # 폰트 경로 설정
-        if FONT_PATH:
-            env["NOTO_FONT_PATH"] = FONT_PATH
-        
-        # 명령어 구성
-        cmd = [
-            PDF2ZH_CMD,
-            input_file,
-            "-o", output_dir,
-            "-s", service,
-            "-li", lang_from,
-            "-lo", lang_to,
-            "-t", "2"
-        ]
-        
-        # 폰트 서브셋팅 비활성화
-        if skip_fonts:
-            cmd.append("--skip-subset-fonts")
-        
-        if pages:
-            cmd.extend(["-p", pages])
-        
-        logger.info(f"실행 명령: {' '.join(cmd)}")
-        
-        # 실행
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=env
-        )
-        
-        logger.info(f"명령 실행 결과: returncode={result.returncode}")
-        if result.stdout:
-            logger.info(f"stdout: {result.stdout[:500]}")
-        if result.stderr:
-            logger.warning(f"stderr: {result.stderr[:500]}")
-        
-        if result.returncode == 0:
-            # 출력 파일 찾기
-            base_name = Path(input_file).stem
-            mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
-            dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
-            
-            if mono_file.exists() and dual_file.exists():
-                return True, str(mono_file), str(dual_file), "번역 완료"
-            else:
-                # 파일명 패턴이 다를 수 있으므로 glob으로 찾기
-                mono_files = list(Path(output_dir).glob("*-mono.pdf"))
-                dual_files = list(Path(output_dir).glob("*-dual.pdf"))
-                
-                if mono_files and dual_files:
-                    return True, str(mono_files[0]), str(dual_files[0]), "번역 완료"
-                else:
-                    return False, None, None, "번역 파일을 찾을 수 없습니다"
-        else:
-            error_msg = result.stderr if result.stderr else result.stdout
-            return False, None, None, f"번역 실패: {error_msg}"
-            
-    except subprocess.TimeoutExpired:
-        return False, None, None, "번역 시간 초과 (10분)"
-    except Exception as e:
-        logger.error(f"pdf2zh CLI 오류: {e}")
-        return False, None, None, str(e)
-
 def main():
     """메인 애플리케이션"""
-    
-    # pdf2zh 체크
-    if not PDF2ZH_AVAILABLE and not PDF2ZH_CLI_AVAILABLE:
-        st.markdown("""
-        <div class="error-box">
-        ❌ <b>pdf2zh를 사용할 수 없습니다</b><br>
-        PDF 번역을 위해 pdf2zh가 필요합니다. 설치를 확인해주세요.
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.code("pip install pdf2zh", language="bash")
-        
-        with st.expander("🔧 문제 해결 방법"):
-            st.markdown(f"""
-            ### 디버깅 정보:
-            - Python 경로: `{sys.executable}`
-            - pdf2zh 모듈: {'✅ 사용 가능' if PDF2ZH_AVAILABLE else '❌ 사용 불가'}
-            - pdf2zh CLI: {'✅ 사용 가능' if PDF2ZH_CLI_AVAILABLE else '❌ 사용 불가'}
-            - ONNX 모델: {'✅ 로드됨' if MODEL_INSTANCE else '❌ 로드 실패'}
-            - 폰트 경로: {FONT_PATH or 'Not set'}
-            """)
-        
-        st.stop()
-    
-    # ONNX 모델 체크
-    if PDF2ZH_AVAILABLE and MODEL_INSTANCE is None:
-        st.markdown("""
-        <div class="warning-box">
-        ⚠️ <b>ONNX 모델 로드 실패</b><br>
-        문서 레이아웃 분석을 위한 모델이 로드되지 않았습니다.<br>
-        모델 다운로드 중이거나 네트워크 문제일 수 있습니다.
-        </div>
-        """, unsafe_allow_html=True)
-        
-        with st.expander("🔧 문제 해결 방법"):
-            st.markdown("""
-            ### 해결 방법:
-            1. 잠시 후 페이지를 새로고침하세요
-            2. 네트워크 연결을 확인하세요
-            3. HuggingFace 모델 다운로드가 차단되지 않았는지 확인하세요
-            
-            ### 대체 방법:
-            CLI 모드를 사용하면 모델이 자동으로 다운로드됩니다.
-            """)
     
     # 헤더
     st.markdown("""
     <div class="main-header">
-        <h1>📐 PDF Math Translator</h1>
-        <p>수식과 레이아웃을 보존하는 과학 논문 번역 - Powered by OpenAI & pdf2zh</p>
+        <h1>📐 PDF Math Translator Pro</h1>
+        <p>수식과 레이아웃을 보존하는 과학 논문 번역 + 이미지 텍스트 번역</p>
+        <p>Powered by pdf2zh, OCR, and OpenAI</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -458,35 +421,66 @@ def main():
     with col2:
         st.metric("번역 문서", len(st.session_state.translation_history), "📚")
     with col3:
-        if MODEL_INSTANCE:
-            st.metric("ONNX", "✅", "🤖")
-        elif PDF2ZH_AVAILABLE:
-            st.metric("pdf2zh", "API ✅", "🔧")
-        elif PDF2ZH_CLI_AVAILABLE:
-            st.metric("pdf2zh", "CLI ✅", "🔧")
+        if st.session_state.ocr_enabled:
+            st.metric("OCR", "활성화 ✅", "🔍")
         else:
-            st.metric("pdf2zh", "❌", "🔧")
+            st.metric("OCR", "비활성화", "🔍")
     
     # 사이드바 설정
     with st.sidebar:
         st.header("⚙️ 번역 설정")
         
-        # 번역 서비스 선택 (OpenAI를 기본값으로)
-        st.subheader("🌐 번역 서비스")
+        # OCR 설정 섹션
+        st.markdown("""
+        <div class="ocr-box">
+            <h3>🔍 OCR 설정 (이미지 텍스트 번역)</h3>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # OpenAI를 기본으로 하되, API 키가 없으면 안내
-        if not st.session_state.api_key:
-            st.markdown("""
-            <div class="api-key-box">
-                <h4>🔑 OpenAI API 키 필요</h4>
-                <p>최고 품질의 번역을 위해 OpenAI GPT를 사용합니다.</p>
-            </div>
-            """, unsafe_allow_html=True)
+        enable_ocr = st.checkbox(
+            "이미지 텍스트 번역 활성화",
+            value=st.session_state.ocr_enabled,
+            help="PDF 내 이미지에 포함된 텍스트도 번역합니다"
+        )
+        st.session_state.ocr_enabled = enable_ocr
+        
+        ocr_settings = {}
+        if enable_ocr:
+            st.info("📸 이미지 내 텍스트를 감지하고 번역합니다")
+            
+            ocr_settings['replace_images'] = st.checkbox(
+                "번역된 이미지로 교체",
+                value=True,
+                help="원본 이미지를 번역된 버전으로 교체"
+            )
+            
+            ocr_settings['overlay_text'] = st.checkbox(
+                "텍스트 오버레이",
+                value=True,
+                help="원본 이미지 위에 번역 텍스트 표시"
+            )
+            
+            ocr_settings['preserve_layout'] = st.checkbox(
+                "레이아웃 유지",
+                value=True,
+                help="원본 텍스트 위치 유지"
+            )
+            
+            ocr_quality = st.select_slider(
+                "OCR 품질",
+                options=["빠름", "보통", "정확"],
+                value="보통",
+                help="높은 품질은 더 정확하지만 시간이 오래 걸립니다"
+            )
+            ocr_settings['quality'] = ocr_quality
+        
+        # 번역 서비스 선택
+        st.subheader("🌐 번역 서비스")
         
         service = st.selectbox(
             "번역 엔진",
             ["openai", "google", "deepl", "azure", "ollama"],
-            index=0,  # openai가 기본
+            index=0,
             help="OpenAI GPT가 가장 정확합니다"
         )
         st.session_state.service = service
@@ -519,56 +513,9 @@ def main():
             )
             envs["OPENAI_MODEL"] = model
             
-            with st.expander("💡 OpenAI API 키 받기"):
-                st.markdown("""
-                **무료 크레딧으로 시작하기:**
-                1. [OpenAI Platform](https://platform.openai.com) 접속
-                2. 회원가입 (구글/MS 계정 가능)
-                3. 신규 가입 시 $5 무료 크레딧 제공
-                4. API keys 메뉴에서 키 생성
-                5. 생성된 키 복사 (sk-로 시작)
-                
-                **예상 비용:**
-                - 10페이지: 약 $0.02 (26원)
-                - 100페이지: 약 $0.20 (260원)
-                - 무료 크레딧으로 약 2500페이지 번역 가능
-                """)
-            
         elif service == "google":
             st.success("🌍 Google 번역 - 무료, API 키 불필요")
             st.info("품질은 OpenAI보다 낮지만 무료입니다")
-            
-        elif service == "deepl":
-            st.info("DeepL - 유럽 언어 전문")
-            deepl_key = st.text_input(
-                "DeepL API Key",
-                type="password",
-                placeholder="xxxxx-xxxxx-xxxxx"
-            )
-            if deepl_key:
-                envs["DEEPL_AUTH_KEY"] = deepl_key
-                
-        elif service == "azure":
-            st.info("Azure Translator")
-            azure_key = st.text_input(
-                "Azure API Key",
-                type="password"
-            )
-            if azure_key:
-                envs["AZURE_API_KEY"] = azure_key
-                
-        elif service == "ollama":
-            st.info("Ollama - 로컬 AI")
-            ollama_host = st.text_input(
-                "Ollama Host",
-                value="http://localhost:11434"
-            )
-            ollama_model = st.text_input(
-                "모델명",
-                value="gemma2"
-            )
-            envs["OLLAMA_HOST"] = ollama_host
-            envs["OLLAMA_MODEL"] = ollama_model
         
         # 언어 설정
         st.subheader("🌍 언어 설정")
@@ -588,13 +535,13 @@ def main():
         source_lang = st.selectbox(
             "원본 언어",
             list(lang_map.keys()),
-            index=0  # 영어가 기본
+            index=0
         )
         
         target_lang = st.selectbox(
             "번역 언어",
             list(lang_map.keys()),
-            index=1  # 한국어가 기본
+            index=1
         )
         
         # 고급 옵션
@@ -611,35 +558,23 @@ def main():
                 help="폰트 오류 시 체크"
             )
             
-            use_api = st.checkbox(
-                "Python API 사용",
-                value=PDF2ZH_AVAILABLE and MODEL_INSTANCE is not None,
-                help="체크 해제 시 CLI 사용",
-                disabled=MODEL_INSTANCE is None
+            threads = st.number_input(
+                "병렬 처리 스레드",
+                min_value=1,
+                max_value=10,
+                value=4,
+                help="더 많은 스레드는 더 빠르지만 API 제한에 주의"
             )
-            
-            if MODEL_INSTANCE is None and PDF2ZH_AVAILABLE:
-                st.warning("⚠️ ONNX 모델이 로드되지 않아 API 모드를 사용할 수 없습니다")
     
     # 메인 영역
-    tab1, tab2, tab3 = st.tabs(["📤 번역하기", "📖 사용법", "ℹ️ 정보"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📤 번역하기", "🔍 OCR 미리보기", "📖 사용법", "ℹ️ 정보"])
     
     with tab1:
-        # OpenAI 선택했는데 API 키 없으면 큰 안내
-        if service == "openai" and "OPENAI_API_KEY" not in envs:
-            st.markdown("""
-            <div class="api-key-box">
-                <h2>🔑 OpenAI API 키를 입력해주세요</h2>
-                <p>왼쪽 사이드바에서 API 키를 입력하면 번역을 시작할 수 있습니다.</p>
-                <p>무료 크레딧 $5로 약 2500페이지를 번역할 수 있습니다.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
         # 파일 업로드
         uploaded_file = st.file_uploader(
             "PDF 파일을 선택하세요",
             type=['pdf'],
-            help="수식이 포함된 과학 논문에 최적화되어 있습니다"
+            help="수식과 이미지가 포함된 과학 논문에 최적화되어 있습니다"
         )
         
         if uploaded_file:
@@ -654,28 +589,31 @@ def main():
                 pages_count = get_pdf_page_count(file_content)
                 
                 # 메트릭
-                col_a, col_b, col_c = st.columns(3)
+                col_a, col_b, col_c, col_d = st.columns(4)
                 with col_a:
                     st.metric("파일 크기", f"{file_size:.1f} MB")
                 with col_b:
                     st.metric("페이지 수", pages_count)
                 with col_c:
                     if service == "openai" and "OPENAI_MODEL" in envs:
-                        cost_info = estimate_cost(pages_count, envs["OPENAI_MODEL"])
+                        cost_info = estimate_cost(pages_count, envs["OPENAI_MODEL"], enable_ocr)
                         st.metric("예상 비용", f"${cost_info['cost_usd']}")
                     else:
                         st.metric("번역 엔진", service.upper())
+                with col_d:
+                    st.metric("OCR", "ON" if enable_ocr else "OFF")
                 
-                # 비용 상세 정보 (OpenAI인 경우)
+                # 비용 상세 정보
                 if service == "openai" and "OPENAI_MODEL" in envs:
-                    st.info(f"""
-                    💰 **예상 비용 상세**
-                    - 모델: {envs["OPENAI_MODEL"]}
-                    - 예상 토큰: {cost_info['tokens']:,}개
-                    - USD: ${cost_info['cost_usd']}
-                    - KRW: ₩{cost_info['cost_krw']:,.0f}
-                    - 무료 크레딧 사용 시: $5에서 차감
-                    """)
+                    with st.expander("💰 예상 비용 상세"):
+                        st.info(f"""
+                        - 모델: {envs["OPENAI_MODEL"]}
+                        - 예상 토큰: {cost_info['tokens']:,}개
+                        - USD: ${cost_info['cost_usd']}
+                        - KRW: ₩{cost_info['cost_krw']:,.0f}
+                        - OCR 사용: {'예' if enable_ocr else '아니오'}
+                        - 무료 크레딧 사용 시: $5에서 차감
+                        """)
                 
                 # PDF 미리보기
                 with st.expander("👁️ PDF 미리보기"):
@@ -694,13 +632,12 @@ def main():
                 st.markdown("### 🎯 번역 실행")
                 
                 # 설정 요약
-                method = "API" if use_api and PDF2ZH_AVAILABLE and MODEL_INSTANCE else "CLI"
                 st.markdown(f"""
                 <div class="info-box">
                 <b>설정 확인</b><br>
                 • 엔진: {service.upper()}<br>
                 • 언어: {source_lang} → {target_lang}<br>
-                • 방식: {method}<br>
+                • OCR: {'활성화 ✅' if enable_ocr else '비활성화'}<br>
                 • 페이지: {pages if pages else '전체'}<br>
                 • 폰트: {'건너뛰기' if skip_fonts else '포함'}
                 </div>
@@ -710,12 +647,6 @@ def main():
                 can_translate = True
                 if service == "openai" and "OPENAI_API_KEY" not in envs:
                     st.error("⚠️ OpenAI API 키를 입력하세요")
-                    can_translate = False
-                elif service == "deepl" and "DEEPL_AUTH_KEY" not in envs:
-                    st.error("⚠️ DeepL API 키를 입력하세요")
-                    can_translate = False
-                elif service == "azure" and "AZURE_API_KEY" not in envs:
-                    st.error("⚠️ Azure API 키를 입력하세요")
                     can_translate = False
                 
                 # 번역 버튼
@@ -732,8 +663,11 @@ def main():
                     output_dir = tempfile.mkdtemp()
                     
                     # 진행 상태 업데이트
-                    progress_bar.progress(0.2)
-                    status_text.text("📚 PDF 분석 중...")
+                    def update_progress(value, text):
+                        progress_bar.progress(value)
+                        status_text.text(text)
+                    
+                    update_progress(0.1, "📚 PDF 분석 중...")
                     
                     # 페이지 범위 파싱
                     pages_list = None
@@ -752,12 +686,24 @@ def main():
                     
                     # 번역 실행
                     start_time = time.time()
-                    progress_bar.progress(0.5)
-                    status_text.text("🔄 번역 중... (시간이 걸릴 수 있습니다)")
+                    update_progress(0.3, "🔄 번역 중... (시간이 걸릴 수 있습니다)")
                     
-                    # API 또는 CLI 선택
-                    if use_api and PDF2ZH_AVAILABLE and MODEL_INSTANCE:
-                        logger.info("Python API 방식으로 번역 시작")
+                    # OCR 사용 여부에 따라 다른 함수 호출
+                    if enable_ocr:
+                        logger.info("OCR을 포함한 번역 시작")
+                        success, mono_file, dual_file, message = translate_with_ocr(
+                            input_path,
+                            output_dir,
+                            service,
+                            lang_map[source_lang],
+                            lang_map[target_lang],
+                            pages_list,
+                            envs,
+                            ocr_settings,
+                            lambda p: update_progress(0.3 + p * 0.6, f"번역 중... {int(p*100)}%")
+                        )
+                    else:
+                        logger.info("기본 pdf2zh 번역 시작")
                         success, mono_file, dual_file, message = translate_with_pdf2zh_api(
                             input_path,
                             output_dir,
@@ -766,33 +712,22 @@ def main():
                             lang_map[target_lang],
                             pages_list,
                             envs,
-                            skip_fonts=skip_fonts
-                        )
-                    else:
-                        logger.info("CLI 방식으로 번역 시작")
-                        success, mono_file, dual_file, message = translate_with_pdf2zh_cli(
-                            input_path,
-                            output_dir,
-                            service,
-                            lang_map[source_lang],
-                            lang_map[target_lang],
-                            pages,
-                            envs,
-                            skip_fonts=skip_fonts
+                            threads,
+                            skip_fonts
                         )
                     
                     elapsed = time.time() - start_time
                     
                     if success:
                         st.balloons()
-                        progress_bar.progress(1.0)
-                        status_text.text("✅ 번역 완료!")
+                        update_progress(1.0, "✅ 번역 완료!")
                         
                         st.markdown(f"""
                         <div class="success-box">
                         🎉 <b>번역 성공!</b><br>
                         ⏱️ 소요 시간: {int(elapsed)}초<br>
-                        📄 출력: 2개 파일 생성됨
+                        📄 출력: 2개 파일 생성됨<br>
+                        {'🔍 OCR 처리: 완료' if enable_ocr else ''}
                         </div>
                         """, unsafe_allow_html=True)
                         
@@ -829,6 +764,7 @@ def main():
                             'filename': uploaded_file.name,
                             'pages': pages_count,
                             'service': service,
+                            'ocr': enable_ocr,
                             'time': datetime.now().strftime("%H:%M")
                         })
                         
@@ -853,153 +789,166 @@ def main():
                         
                         with st.expander("🔍 디버깅 정보"):
                             st.code(message)
-                            st.write("**Python:**", sys.version)
-                            st.write("**pdf2zh Module:**", PDF2ZH_AVAILABLE)
-                            st.write("**pdf2zh CLI:**", PDF2ZH_CLI_AVAILABLE)
-                            st.write("**pdf2zh CMD:**", PDF2ZH_CMD)
-                            st.write("**ONNX Model:**", "Loaded" if MODEL_INSTANCE else "Not loaded")
-                            st.write("**작업 디렉토리:**", os.getcwd())
-                            st.write("**임시 파일:**", input_path)
-                            st.write("**출력 디렉토리:**", output_dir)
-                            st.write("**폰트 경로:**", FONT_PATH)
-                            
-                            # 폰트 파일 확인
-                            if FONT_PATH:
-                                st.write("**폰트 파일 존재:**", os.path.exists(FONT_PATH))
-                                if os.path.exists(FONT_PATH):
-                                    st.write("**폰트 파일 크기:**", os.path.getsize(FONT_PATH), "bytes")
+                            st.write("**OCR 활성화:**", enable_ocr)
+                            st.write("**설정:**", ocr_settings if enable_ocr else "N/A")
     
     with tab2:
-        st.markdown("""
-        ### 📖 사용 가이드
+        st.markdown("### 🔍 OCR 미리보기")
         
-        #### 🚀 빠른 시작 (OpenAI 추천)
-        
-        **1단계: OpenAI API 키 받기**
-        1. [platform.openai.com](https://platform.openai.com) 접속
-        2. 회원가입 (구글/MS 계정 가능)
-        3. 신규 가입 시 **$5 무료 크레딧** 자동 제공
-        4. API keys 메뉴에서 'Create new secret key' 클릭
-        5. 생성된 키 복사 (sk-로 시작)
-        
-        **2단계: 번역하기**
-        1. 왼쪽 사이드바에 API 키 붙여넣기
-        2. PDF 파일 업로드
-        3. 번역 시작 클릭
-        
-        #### 💰 비용 안내
-        
-        **OpenAI 무료 크레딧**
-        - 신규 가입 시 $5 무료 제공
-        - 약 2500페이지 번역 가능
-        - 추가 결제 없이 사용 가능
-        
-        **페이지별 예상 비용** (gpt-4o-mini 기준)
-        | 페이지 | USD | KRW | 무료 크레딧 |
-        |--------|-----|-----|------------|
-        | 10 | $0.02 | ₩26 | 0.4% 사용 |
-        | 50 | $0.10 | ₩130 | 2% 사용 |
-        | 100 | $0.20 | ₩260 | 4% 사용 |
-        | 500 | $1.00 | ₩1,300 | 20% 사용 |
-        
-        #### 🆓 무료 옵션
-        
-        **Google 번역 사용**
-        - API 키 불필요
-        - 완전 무료
-        - 품질은 OpenAI보다 낮음
-        - 사이드바에서 'google' 선택
-        
-        #### ✨ pdf2zh의 특징
-        - 📐 **수식 완벽 보존**: LaTeX 수식 그대로 유지
-        - 📑 **레이아웃 유지**: 원본 구조 보존
-        - 🔤 **폰트 보존**: 서체와 스타일 유지
-        - 📊 **도표 위치 유지**: 그래프와 표 위치 보존
-        
-        #### 💡 사용 팁
-        
-        **비용 절감**
-        - 필요한 페이지만 지정 (예: 1-10)
-        - gpt-4o-mini 모델 사용 (기본값)
-        - 초록과 결론만 먼저 번역
-        
-        **품질 최적화**
-        - OpenAI 서비스 사용
-        - 전체 문서 한 번에 번역
-        - dual 파일로 원문 대조 확인
-        
-        #### ⚠️ 주의사항
-        - 스캔된 이미지 PDF는 지원 안 됨
-        - 50MB 이상 파일은 시간이 오래 걸림
-        - 암호화된 PDF는 지원 안 됨
-        
-        #### 🔧 문제 해결
-        
-        **"폰트 오류" 발생 시**
-        1. 고급 옵션에서 "폰트 서브셋 건너뛰기" 체크
-        2. 다시 번역 시도
-        
-        **"API 키 오류" 발생 시**
-        1. API 키가 sk-로 시작하는지 확인
-        2. 키 전체를 복사했는지 확인
-        3. OpenAI 계정에 크레딧이 있는지 확인
-        
-        **번역이 너무 오래 걸릴 때**
-        1. 페이지 범위 지정 (예: 1-5)
-        2. Google 번역으로 전환
-        """)
+        if uploaded_file and enable_ocr:
+            st.info("📸 이미지에서 감지된 텍스트를 미리 확인할 수 있습니다")
+            
+            if st.button("이미지 텍스트 감지"):
+                with st.spinner("이미지 분석 중..."):
+                    # 임시로 PDF 저장
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                        tmp.write(uploaded_file.getvalue())
+                        tmp_path = tmp.name
+                    
+                    try:
+                        # ImageProcessor로 이미지 추출 및 텍스트 감지
+                        processor = ImageProcessor()
+                        images_with_text = processor.extract_images_with_text(tmp_path)
+                        
+                        if images_with_text:
+                            st.success(f"✅ {len(images_with_text)}개 이미지에서 텍스트 감지됨")
+                            
+                            for idx, img_data in enumerate(images_with_text):
+                                with st.expander(f"이미지 {idx + 1}"):
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.image(img_data['image'], caption="원본 이미지", use_column_width=True)
+                                    with col2:
+                                        st.markdown("**감지된 텍스트:**")
+                                        for text in img_data['texts']:
+                                            st.write(f"- {text['text']}")
+                        else:
+                            st.warning("텍스트가 포함된 이미지를 찾을 수 없습니다")
+                            
+                    except Exception as e:
+                        st.error(f"오류: {e}")
+                    finally:
+                        os.unlink(tmp_path)
+        else:
+            st.info("PDF를 업로드하고 OCR을 활성화하면 이미지 텍스트를 미리 볼 수 있습니다")
     
     with tab3:
         st.markdown("""
-        ### ℹ️ PDF Math Translator 정보
+        ### 📖 사용 가이드
         
-        **버전**: pdf2zh 1.9.0+ with OpenAI GPT  
-        **기본 엔진**: OpenAI GPT-4o-mini  
-        **개발**: Byaidu & Contributors  
+        #### 🆕 이미지 텍스트 번역 기능
         
-        #### 🤖 OpenAI GPT 우선 이유
+        **OCR (Optical Character Recognition) 기능:**
+        - 📸 PDF 내 이미지에 포함된 텍스트 자동 감지
+        - 🔄 감지된 텍스트를 선택한 언어로 번역
+        - 🎨 번역된 텍스트를 원본 이미지 위에 오버레이
+        - 📐 원본 레이아웃과 위치 유지
         
-        **최고의 번역 품질**
-        - 전문 용어 정확도 95% 이상
-        - 문맥 이해 능력 탁월
-        - 수식 설명 자연스러움
-        - 학술 문체 완벽 보존
+        **지원하는 이미지 유형:**
+        - 그래프와 차트의 라벨
+        - 스크린샷 내 텍스트
+        - 다이어그램의 설명
+        - 스캔된 문서
+        - 사진 속 텍스트
         
-        **합리적인 비용**
-        - 무료 크레딧 $5 제공
-        - 페이지당 약 2센트 (26원)
-        - 논문 1편 약 50센트 (650원)
+        #### 🚀 빠른 시작
         
-        #### 🛠️ 기술 스택
-        - **AI 엔진**: OpenAI GPT-4 시리즈
-        - **PDF 처리**: pdf2zh (수식 보존)
-        - **레이아웃**: ONNX DocLayout-YOLO
-        - **폰트**: Go Noto Universal
-        - **프레임워크**: Streamlit
+        **1단계: OCR 활성화**
+        1. 왼쪽 사이드바에서 "이미지 텍스트 번역 활성화" 체크
+        2. OCR 설정 조정 (선택사항)
         
-        #### 📊 서비스 비교
+        **2단계: 번역 실행**
+        1. PDF 파일 업로드
+        2. 번역 언어 선택
+        3. "번역 시작" 클릭
         
-        | 항목 | OpenAI | Google | DeepL |
-        |------|--------|--------|-------|
-        | 품질 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
-        | 속도 | 빠름 | 매우 빠름 | 빠름 |
-        | 비용 | 유료 | 무료 | 유료 |
-        | 수식 | 완벽 | 보통 | 좋음 |
-        | 전문용어 | 탁월 | 보통 | 좋음 |
+        #### 💡 사용 팁
+        
+        **OCR 품질 향상:**
+        - 고해상도 PDF 사용 권장
+        - 선명한 이미지일수록 정확도 향상
+        - "정확" 모드는 시간이 오래 걸리지만 품질 최고
+        
+        **최적 설정:**
+        - 과학 논문: OCR + 레이아웃 유지
+        - 프레젠테이션: OCR + 텍스트 오버레이
+        - 스캔 문서: OCR + 이미지 교체
+        
+        #### ⚠️ 주의사항
+        
+        **OCR 한계:**
+        - 손글씨는 인식률이 낮을 수 있음
+        - 복잡한 수식은 텍스트로만 처리
+        - 장식 폰트는 인식 오류 가능
+        
+        **성능 고려사항:**
+        - OCR 사용 시 처리 시간 증가
+        - 이미지가 많을수록 시간 소요
+        - API 비용 약 1.5배 증가
+        """)
+    
+    with tab4:
+        st.markdown("""
+        ### ℹ️ PDF Math Translator Pro 정보
+        
+        **버전**: pdf2zh 1.9.0+ with OCR Enhancement  
+        **기본 엔진**: OpenAI GPT-4o-mini + EasyOCR  
+        **개발**: Enhanced by Streamlit Community  
+        
+        #### 🔍 OCR 기술 스택
+        
+        **이미지 처리:**
+        - **OCR 엔진**: EasyOCR (80+ 언어 지원)
+        - **이미지 처리**: OpenCV + PIL
+        - **레이아웃 분석**: CRAFT 텍스트 감지
+        - **폰트 렌더링**: FreeType + HarfBuzz
+        
+        **번역 파이프라인:**
+        1. PDF → 이미지 추출 (PyMuPDF)
+        2. 텍스트 감지 (EasyOCR)
+        3. 번역 (OpenAI/Google)
+        4. 이미지 재생성 (PIL + OpenCV)
+        5. PDF 재구성 (PyMuPDF)
+        
+        #### 📊 성능 비교
+        
+        | 기능 | 기본 모드 | OCR 모드 |
+        |------|----------|----------|
+        | 텍스트 레이어 | ✅ | ✅ |
+        | 수식 | ✅ | ✅ |
+        | 이미지 텍스트 | ❌ | ✅ |
+        | 그래프 라벨 | ❌ | ✅ |
+        | 처리 속도 | 빠름 | 보통 |
+        | API 비용 | 기본 | 1.5x |
+        
+        #### 🛠️ 주요 기능
+        
+        **pdf2zh 기본 기능:**
+        - 📐 수식 완벽 보존
+        - 📑 레이아웃 유지
+        - 🔤 폰트 보존
+        - 📊 도표 위치 유지
+        
+        **OCR 추가 기능:**
+        - 🖼️ 이미지 텍스트 번역
+        - 📈 그래프 라벨 번역
+        - 📸 스크린샷 번역
+        - 🎨 텍스트 오버레이
         
         #### 🔗 관련 링크
         - [GitHub: PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
+        - [EasyOCR Documentation](https://github.com/JaidedAI/EasyOCR)
         - [OpenAI Platform](https://platform.openai.com)
         - [온라인 데모](https://pdf2zh.com)
-        - [문제 신고](https://github.com/Byaidu/PDFMathTranslate/issues)
         
         #### 📝 라이선스
         - pdf2zh: AGPL-3.0
+        - EasyOCR: Apache 2.0
         - OpenAI API: 상용 라이선스
         - 번역 결과물: 사용자 소유
         
         #### 🙏 감사의 말
-        pdf2zh 개발팀과 OpenAI에 감사드립니다.
+        pdf2zh 개발팀, EasyOCR 팀, OpenAI에 감사드립니다.
         오픈소스 커뮤니티의 기여로 발전하고 있습니다.
         """)
 
