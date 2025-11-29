@@ -313,12 +313,23 @@ def translate_pdf(
 
     Returns dict with output file paths or None on failure.
     """
+    import shutil
+
     # 출력 디렉토리 생성
     output_dir = settings.get("download_path", tempfile.mkdtemp())
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
     base_name = Path(file_path).stem
+
+    # 원본 PDF를 출력 디렉토리에 복사 (pdf2zh 처리 후에도 사용 가능하도록)
+    original_copy = Path(output_dir) / f"{base_name}-original.pdf"
+    try:
+        shutil.copy2(file_path, original_copy)
+        logger.info(f"원본 PDF 복사: {original_copy}")
+    except Exception as e:
+        logger.warning(f"원본 PDF 복사 실패: {e}")
+        original_copy = Path(file_path)  # 복사 실패 시 원본 사용
 
     # 이미지 전용 모드: OCR로 전체 페이지 번역
     if (settings.get("translate_images") and
@@ -333,7 +344,7 @@ def translate_pdf(
             progress_placeholder.info(f"페이지 OCR 번역 중... ({current}/{total})")
 
         img_result = translate_pdf_images(
-            file_path,
+            str(original_copy),  # 복사본 사용
             str(ocr_output),
             settings,
             progress_cb
@@ -433,15 +444,14 @@ def translate_pdf(
 
             progress_placeholder.info("2단계: 그림/차트 내 텍스트 OCR 번역 중...")
 
-            # 원본 PDF에서 이미지 번역하여 별도 파일 생성
-            # (pdf2zh 출력이 아닌 원본 사용 - 그림 내 텍스트가 원본에 있음)
+            # 복사된 원본 PDF에서 이미지 번역하여 별도 파일 생성
             ocr_output = Path(output_dir) / f"{base_name}-ocr.pdf"
 
             def progress_cb(current, total):
                 progress_placeholder.info(f"그림 OCR 번역 중... ({current}/{total})")
 
             img_result = translate_pdf_images(
-                file_path,  # 원본 PDF 사용
+                str(original_copy),  # 복사본 사용
                 str(ocr_output),
                 settings,
                 progress_cb
