@@ -1,226 +1,102 @@
 """
-메인 윈도우 - PDF 번역기 GUI
+메인 윈도우
 """
-import os
 import sys
 from pathlib import Path
-from typing import Optional, List
+from datetime import datetime
+from typing import Optional
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QSpinBox,
     QFileDialog, QProgressBar, QTextEdit, QGroupBox,
     QSplitter, QScrollArea, QMessageBox, QStatusBar,
-    QToolBar, QAction, QFrame
+    QAction, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QImage, QFont, QTextCursor
 
 from PIL import Image
-import numpy as np
 
-# 상위 경로 추가
+# 경로 설정
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import ConfigManager, LANGUAGES, OCR_LANGUAGES
-from core.ocr_engine import OCREngine, TextRegion
-from core.translator import OpenAITranslator
-from core.pdf_processor import PDFProcessor
-from core.image_editor import ImageEditor
+from utils.config import Config, LANGUAGES, TESSERACT_LANGS
+from core.engine import TranslationEngine
+from core.pdf_handler import PDFHandler
 
 
-class TranslationWorker(QThread):
+class Worker(QThread):
     """번역 작업 스레드"""
 
-    progress = pyqtSignal(int, str)  # 진행률, 메시지
-    page_completed = pyqtSignal(int, object)  # 페이지 번호, 이미지
-    finished = pyqtSignal(bool, str)  # 성공 여부, 메시지
-    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, str)
+    image = pyqtSignal(int, object)
+    finished = pyqtSignal(bool, str)
 
-    def __init__(
-        self,
-        pdf_path: str,
-        output_path: str,
-        config: ConfigManager,
-        page_range: Optional[tuple] = None
-    ):
+    def __init__(self, engine: TranslationEngine, input_path: str,
+                 output_path: str, page_start: int, page_end: int,
+                 ocr_conf: float):
         super().__init__()
-        self.pdf_path = pdf_path
+        self.engine = engine
+        self.input_path = input_path
         self.output_path = output_path
-        self.config = config
-        self.page_range = page_range
-        self._is_cancelled = False
-
-    def cancel(self):
-        """작업 취소"""
-        self._is_cancelled = True
+        self.page_start = page_start
+        self.page_end = page_end
+        self.ocr_conf = ocr_conf
 
     def run(self):
-        """번역 작업 실행"""
-        try:
-            # 초기화
-            self.progress.emit(0, "초기화 중...")
+        # 콜백 연결
+        self.engine.set_callbacks(
+            log=lambda m: self.log.emit(m),
+            progress=lambda p, m: self.progress.emit(p, m),
+            image=lambda n, i: self.image.emit(n, i),
+        )
 
-            # OCR 엔진 초기화
-            ocr = OCREngine()
-            ocr_lang = OCR_LANGUAGES.get(
-                self.config.config.source_lang, "en"
-            )
-            ocr.set_language(ocr_lang)
+        result = self.engine.translate(
+            self.input_path,
+            self.output_path,
+            self.page_start,
+            self.page_end,
+            self.ocr_conf,
+        )
 
-            # 번역기 초기화
-            translator = OpenAITranslator(
-                api_key=self.config.config.openai_api_key,
-                model=self.config.config.openai_model,
-                source_lang=self.config.config.source_lang,
-                target_lang=self.config.config.target_lang
-            )
-
-            # 이미지 편집기 초기화
-            editor = ImageEditor(self.config.config.font_path or None)
-
-            # PDF 처리
-            self.progress.emit(5, "PDF 로딩 중...")
-
-            with PDFProcessor(
-                self.pdf_path,
-                dpi=self.config.config.render_dpi
-            ) as processor:
-
-                page_count = processor.get_page_count()
-
-                # 페이지 범위 결정
-                if self.page_range:
-                    start, end = self.page_range
-                    start = max(0, start)
-                    end = min(end, page_count - 1)
-                else:
-                    start, end = 0, page_count - 1
-
-                total_pages = end - start + 1
-                translated_images = []
-
-                for idx, page_num in enumerate(range(start, end + 1)):
-                    if self._is_cancelled:
-                        self.finished.emit(False, "사용자에 의해 취소됨")
-                        return
-
-                    progress_pct = int(10 + (idx / total_pages) * 80)
-                    self.progress.emit(
-                        progress_pct,
-                        f"페이지 {page_num + 1}/{page_count} 처리 중..."
-                    )
-
-                    # 페이지 렌더링
-                    page_image = processor.render_page(page_num)
-                    pil_image = page_image.image
-
-                    # OCR
-                    self.progress.emit(
-                        progress_pct,
-                        f"페이지 {page_num + 1} OCR 중..."
-                    )
-                    ocr_result = ocr.extract_text_from_pil(
-                        pil_image,
-                        self.config.config.ocr_confidence_threshold
-                    )
-
-                    if ocr_result.regions:
-                        # 번역
-                        self.progress.emit(
-                            progress_pct,
-                            f"페이지 {page_num + 1} 번역 중..."
-                        )
-
-                        texts = [r.text for r in ocr_result.regions]
-                        translations = translator.translate_batch(texts)
-
-                        # 이미지에 번역 적용
-                        self.progress.emit(
-                            progress_pct,
-                            f"페이지 {page_num + 1} 이미지 편집 중..."
-                        )
-
-                        translated_img = editor.replace_all_text(
-                            pil_image,
-                            ocr_result.regions,
-                            translations,
-                            erase_method="inpaint"
-                        )
-                    else:
-                        # OCR 결과 없으면 원본 이미지 사용
-                        translated_img = pil_image
-
-                    translated_images.append(translated_img)
-                    self.page_completed.emit(page_num, translated_img)
-
-                # PDF 생성
-                self.progress.emit(95, "PDF 생성 중...")
-                PDFProcessor.create_pdf_from_images(
-                    translated_images,
-                    self.output_path
-                )
-
-                self.progress.emit(100, "완료!")
-                self.finished.emit(True, f"번역 완료: {self.output_path}")
-
-        except Exception as e:
-            self.error.emit(str(e))
-            self.finished.emit(False, f"오류 발생: {e}")
+        if result.success:
+            self.finished.emit(True, f"완료: {result.output_path}")
+        else:
+            self.finished.emit(False, result.error or "알 수 없는 오류")
 
 
-class ImagePreviewWidget(QScrollArea):
-    """이미지 미리보기 위젯"""
+class ImagePreview(QScrollArea):
+    """이미지 미리보기"""
 
     def __init__(self):
         super().__init__()
         self.setWidgetResizable(True)
-        self.setAlignment(Qt.AlignCenter)
-
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
-        self.label.setStyleSheet("background-color: #f0f0f0;")
+        self.label.setStyleSheet("background: #f0f0f0;")
         self.setWidget(self.label)
+        self._pixmap = None
 
-        self.current_pixmap = None
+    def set_image(self, img: Image.Image):
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        data = img.tobytes("raw", "RGB")
+        qimg = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        self._pixmap = QPixmap.fromImage(qimg)
+        self._update()
 
-    def set_image(self, image: Image.Image):
-        """PIL 이미지 표시"""
-        # PIL -> QPixmap 변환
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        data = image.tobytes("raw", "RGB")
-        qimg = QImage(
-            data,
-            image.width,
-            image.height,
-            image.width * 3,
-            QImage.Format_RGB888
-        )
-        self.current_pixmap = QPixmap.fromImage(qimg)
-        self._update_display()
-
-    def _update_display(self):
-        """디스플레이 업데이트"""
-        if self.current_pixmap:
-            # 스크롤 영역에 맞게 크기 조정
-            scaled = self.current_pixmap.scaled(
-                self.size() * 0.95,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
+    def _update(self):
+        if self._pixmap:
+            scaled = self._pixmap.scaled(
+                self.size() * 0.95, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             self.label.setPixmap(scaled)
 
-    def resizeEvent(self, event):
-        """크기 변경 시 이미지 재조정"""
-        super().resizeEvent(event)
-        self._update_display()
-
-    def clear(self):
-        """이미지 지우기"""
-        self.label.clear()
-        self.current_pixmap = None
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._update()
 
 
 class MainWindow(QMainWindow):
@@ -228,418 +104,368 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.config = ConfigManager()
-        self.current_pdf_path = None
-        self.worker = None
+        self.config = Config.load()
+        self.pdf_path: Optional[str] = None
+        self.worker: Optional[Worker] = None
+        self.engine: Optional[TranslationEngine] = None
 
         self._init_ui()
-        self._load_settings()
+        self._load_config()
 
     def _init_ui(self):
-        """UI 초기화"""
-        self.setWindowTitle("PDF Translator Local")
+        self.setWindowTitle("PDF Translator")
         self.setMinimumSize(1200, 800)
 
         # 중앙 위젯
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
 
-        # 메인 레이아웃
-        main_layout = QHBoxLayout(central_widget)
+        # 좌측 패널
+        left = self._create_left_panel()
+        left.setMaximumWidth(350)
 
-        # 왼쪽 패널 (설정)
-        left_panel = self._create_left_panel()
-        left_panel.setMaximumWidth(350)
-
-        # 오른쪽 패널 (미리보기)
-        right_panel = self._create_right_panel()
+        # 우측 패널
+        right = self._create_right_panel()
 
         # 스플리터
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
+        splitter.addWidget(left)
+        splitter.addWidget(right)
         splitter.setSizes([350, 850])
-
-        main_layout.addWidget(splitter)
+        layout.addWidget(splitter)
 
         # 상태바
         self.statusbar = QStatusBar()
         self.setStatusBar(self.statusbar)
         self.statusbar.showMessage("준비됨")
 
-        # 메뉴바
-        self._create_menubar()
+        # 메뉴
+        self._create_menu()
 
-    def _create_menubar(self):
-        """메뉴바 생성"""
-        menubar = self.menuBar()
+    def _create_menu(self):
+        menu = self.menuBar()
 
-        # 파일 메뉴
-        file_menu = menubar.addMenu("파일")
-
-        open_action = QAction("PDF 열기", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._open_pdf)
-        file_menu.addAction(open_action)
-
+        # 파일
+        file_menu = menu.addMenu("파일")
+        open_act = QAction("PDF 열기", self)
+        open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self._open_pdf)
+        file_menu.addAction(open_act)
         file_menu.addSeparator()
+        exit_act = QAction("종료", self)
+        exit_act.setShortcut("Ctrl+Q")
+        exit_act.triggered.connect(self.close)
+        file_menu.addAction(exit_act)
 
-        exit_action = QAction("종료", self)
-        exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-
-        # 설정 메뉴
-        settings_menu = menubar.addMenu("설정")
-
-        api_action = QAction("API 설정", self)
-        api_action.triggered.connect(self._open_settings)
-        settings_menu.addAction(api_action)
+        # 설정
+        settings_menu = menu.addMenu("설정")
+        api_act = QAction("API 설정", self)
+        api_act.triggered.connect(self._open_settings)
+        settings_menu.addAction(api_act)
 
     def _create_left_panel(self) -> QWidget:
-        """왼쪽 패널 생성 (설정)"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        # 파일 선택
-        file_group = QGroupBox("PDF 파일")
-        file_layout = QVBoxLayout(file_group)
-
+        # 파일
+        file_grp = QGroupBox("PDF 파일")
+        file_lay = QVBoxLayout(file_grp)
         self.file_label = QLabel("파일을 선택하세요")
         self.file_label.setWordWrap(True)
-        file_layout.addWidget(self.file_label)
+        file_lay.addWidget(self.file_label)
+        open_btn = QPushButton("PDF 열기")
+        open_btn.clicked.connect(self._open_pdf)
+        file_lay.addWidget(open_btn)
+        layout.addWidget(file_grp)
 
-        file_btn = QPushButton("PDF 열기")
-        file_btn.clicked.connect(self._open_pdf)
-        file_layout.addWidget(file_btn)
+        # 언어
+        lang_grp = QGroupBox("언어")
+        lang_lay = QVBoxLayout(lang_grp)
 
-        layout.addWidget(file_group)
+        src_lay = QHBoxLayout()
+        src_lay.addWidget(QLabel("원본:"))
+        self.src_combo = QComboBox()
+        self.src_combo.addItems(list(LANGUAGES.keys()))
+        src_lay.addWidget(self.src_combo)
+        lang_lay.addLayout(src_lay)
 
-        # 언어 설정
-        lang_group = QGroupBox("언어 설정")
-        lang_layout = QVBoxLayout(lang_group)
+        tgt_lay = QHBoxLayout()
+        tgt_lay.addWidget(QLabel("번역:"))
+        self.tgt_combo = QComboBox()
+        self.tgt_combo.addItems(list(LANGUAGES.keys()))
+        tgt_lay.addWidget(self.tgt_combo)
+        lang_lay.addLayout(tgt_lay)
 
-        # 원본 언어
-        source_layout = QHBoxLayout()
-        source_layout.addWidget(QLabel("원본:"))
-        self.source_lang_combo = QComboBox()
-        self.source_lang_combo.addItems(list(LANGUAGES.keys()))
-        source_layout.addWidget(self.source_lang_combo)
-        lang_layout.addLayout(source_layout)
+        layout.addWidget(lang_grp)
 
-        # 대상 언어
-        target_layout = QHBoxLayout()
-        target_layout.addWidget(QLabel("번역:"))
-        self.target_lang_combo = QComboBox()
-        self.target_lang_combo.addItems(list(LANGUAGES.keys()))
-        target_layout.addWidget(self.target_lang_combo)
-        lang_layout.addLayout(target_layout)
+        # 페이지
+        page_grp = QGroupBox("페이지")
+        page_lay = QVBoxLayout(page_grp)
 
-        layout.addWidget(lang_group)
+        range_lay = QHBoxLayout()
+        range_lay.addWidget(QLabel("시작:"))
+        self.start_spin = QSpinBox()
+        self.start_spin.setMinimum(1)
+        self.start_spin.setMaximum(9999)
+        range_lay.addWidget(self.start_spin)
+        range_lay.addWidget(QLabel("끝:"))
+        self.end_spin = QSpinBox()
+        self.end_spin.setMinimum(1)
+        self.end_spin.setMaximum(9999)
+        range_lay.addWidget(self.end_spin)
+        page_lay.addLayout(range_lay)
 
-        # 페이지 설정
-        page_group = QGroupBox("페이지 설정")
-        page_layout = QVBoxLayout(page_group)
+        self.page_label = QLabel("총 페이지: -")
+        page_lay.addWidget(self.page_label)
 
-        page_range_layout = QHBoxLayout()
-        page_range_layout.addWidget(QLabel("시작:"))
-        self.start_page_spin = QSpinBox()
-        self.start_page_spin.setMinimum(1)
-        self.start_page_spin.setMaximum(9999)
-        page_range_layout.addWidget(self.start_page_spin)
+        layout.addWidget(page_grp)
 
-        page_range_layout.addWidget(QLabel("끝:"))
-        self.end_page_spin = QSpinBox()
-        self.end_page_spin.setMinimum(1)
-        self.end_page_spin.setMaximum(9999)
-        page_range_layout.addWidget(self.end_page_spin)
+        # 고급
+        adv_grp = QGroupBox("고급")
+        adv_lay = QVBoxLayout(adv_grp)
 
-        page_layout.addLayout(page_range_layout)
-
-        self.page_info_label = QLabel("총 페이지: -")
-        page_layout.addWidget(self.page_info_label)
-
-        layout.addWidget(page_group)
-
-        # 고급 설정
-        advanced_group = QGroupBox("고급 설정")
-        advanced_layout = QVBoxLayout(advanced_group)
-
-        # DPI 설정
-        dpi_layout = QHBoxLayout()
-        dpi_layout.addWidget(QLabel("렌더링 DPI:"))
+        dpi_lay = QHBoxLayout()
+        dpi_lay.addWidget(QLabel("DPI:"))
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(72, 300)
         self.dpi_spin.setValue(150)
-        dpi_layout.addWidget(self.dpi_spin)
-        advanced_layout.addLayout(dpi_layout)
+        dpi_lay.addWidget(self.dpi_spin)
+        adv_lay.addLayout(dpi_lay)
 
-        # 모델 선택
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("OpenAI 모델:"))
+        model_lay = QHBoxLayout()
+        model_lay.addWidget(QLabel("모델:"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"])
-        model_layout.addWidget(self.model_combo)
-        advanced_layout.addLayout(model_layout)
+        model_lay.addWidget(self.model_combo)
+        adv_lay.addLayout(model_lay)
 
-        layout.addWidget(advanced_group)
+        layout.addWidget(adv_grp)
 
-        # 진행 상태
-        progress_group = QGroupBox("진행 상태")
-        progress_layout = QVBoxLayout(progress_group)
-
+        # 진행
+        prog_grp = QGroupBox("진행")
+        prog_lay = QVBoxLayout(prog_grp)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        progress_layout.addWidget(self.progress_bar)
-
+        prog_lay.addWidget(self.progress_bar)
         self.progress_label = QLabel("대기 중")
-        progress_layout.addWidget(self.progress_label)
-
-        layout.addWidget(progress_group)
+        prog_lay.addWidget(self.progress_label)
+        layout.addWidget(prog_grp)
 
         # 버튼
-        btn_layout = QHBoxLayout()
-
-        self.translate_btn = QPushButton("번역 시작")
-        self.translate_btn.setEnabled(False)
-        self.translate_btn.clicked.connect(self._start_translation)
-        self.translate_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
+        btn_lay = QHBoxLayout()
+        self.start_btn = QPushButton("번역 시작")
+        self.start_btn.setEnabled(False)
+        self.start_btn.clicked.connect(self._start)
+        self.start_btn.setStyleSheet("""
+            QPushButton { background: #4CAF50; color: white; font-weight: bold; padding: 10px; border-radius: 5px; }
+            QPushButton:hover { background: #45a049; }
+            QPushButton:disabled { background: #ccc; }
         """)
-        btn_layout.addWidget(self.translate_btn)
+        btn_lay.addWidget(self.start_btn)
 
         self.cancel_btn = QPushButton("취소")
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self._cancel_translation)
-        btn_layout.addWidget(self.cancel_btn)
+        self.cancel_btn.clicked.connect(self._cancel)
+        btn_lay.addWidget(self.cancel_btn)
 
-        layout.addLayout(btn_layout)
-
-        # 빈 공간
+        layout.addLayout(btn_lay)
         layout.addStretch()
 
         return panel
 
     def _create_right_panel(self) -> QWidget:
-        """오른쪽 패널 생성 (미리보기)"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        # 미리보기 라벨
-        preview_label = QLabel("페이지 미리보기")
+        # 미리보기
+        preview_label = QLabel("미리보기")
         preview_label.setFont(QFont("Arial", 12, QFont.Bold))
         layout.addWidget(preview_label)
 
-        # 미리보기 위젯
-        self.preview_widget = ImagePreviewWidget()
-        layout.addWidget(self.preview_widget)
+        self.preview = ImagePreview()
+        layout.addWidget(self.preview)
 
         # 로그
-        log_group = QGroupBox("로그")
-        log_layout = QVBoxLayout(log_group)
+        log_grp = QGroupBox("실시간 로그")
+        log_lay = QVBoxLayout(log_grp)
+
+        ctrl_lay = QHBoxLayout()
+        self.auto_scroll = QCheckBox("자동 스크롤")
+        self.auto_scroll.setChecked(True)
+        ctrl_lay.addWidget(self.auto_scroll)
+        ctrl_lay.addStretch()
+        clear_btn = QPushButton("지우기")
+        clear_btn.clicked.connect(lambda: self.log_text.clear())
+        ctrl_lay.addWidget(clear_btn)
+        log_lay.addLayout(ctrl_lay)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
+        self.log_text.setMinimumHeight(200)
+        self.log_text.setStyleSheet("""
+            QTextEdit { background: #1e1e1e; color: #d4d4d4;
+                font-family: Consolas, monospace; font-size: 12px; }
+        """)
+        log_lay.addWidget(self.log_text)
 
-        layout.addWidget(log_group)
+        layout.addWidget(log_grp)
 
         return panel
 
-    def _load_settings(self):
-        """설정 로드"""
-        config = self.config.config
+    def _load_config(self):
+        c = self.config
+        idx = self.src_combo.findText(c.source_lang)
+        if idx >= 0: self.src_combo.setCurrentIndex(idx)
+        idx = self.tgt_combo.findText(c.target_lang)
+        if idx >= 0: self.tgt_combo.setCurrentIndex(idx)
+        self.dpi_spin.setValue(c.render_dpi)
+        idx = self.model_combo.findText(c.openai_model)
+        if idx >= 0: self.model_combo.setCurrentIndex(idx)
 
-        # 언어 설정
-        idx = self.source_lang_combo.findText(config.source_lang)
-        if idx >= 0:
-            self.source_lang_combo.setCurrentIndex(idx)
-
-        idx = self.target_lang_combo.findText(config.target_lang)
-        if idx >= 0:
-            self.target_lang_combo.setCurrentIndex(idx)
-
-        # DPI
-        self.dpi_spin.setValue(config.render_dpi)
-
-        # 모델
-        idx = self.model_combo.findText(config.openai_model)
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-
-    def _save_settings(self):
-        """설정 저장"""
-        self.config.config.source_lang = self.source_lang_combo.currentText()
-        self.config.config.target_lang = self.target_lang_combo.currentText()
-        self.config.config.render_dpi = self.dpi_spin.value()
-        self.config.config.openai_model = self.model_combo.currentText()
-        self.config.save_config()
+    def _save_config(self):
+        c = self.config
+        c.source_lang = self.src_combo.currentText()
+        c.target_lang = self.tgt_combo.currentText()
+        c.render_dpi = self.dpi_spin.value()
+        c.openai_model = self.model_combo.currentText()
+        c.save()
 
     def _open_pdf(self):
-        """PDF 파일 열기"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "PDF 파일 선택",
-            "",
-            "PDF Files (*.pdf)"
-        )
-
-        if file_path:
-            self.current_pdf_path = file_path
-            self.file_label.setText(Path(file_path).name)
-
-            # PDF 정보 가져오기
-            try:
-                with PDFProcessor(file_path) as processor:
-                    info = processor.get_info()
-                    self.page_info_label.setText(f"총 페이지: {info.page_count}")
-
-                    self.start_page_spin.setMaximum(info.page_count)
-                    self.end_page_spin.setMaximum(info.page_count)
-                    self.start_page_spin.setValue(1)
-                    self.end_page_spin.setValue(info.page_count)
-
-                    # 첫 페이지 미리보기
-                    page_img = processor.render_page(0)
-                    self.preview_widget.set_image(page_img.image)
-
-                self.translate_btn.setEnabled(True)
-                self.statusbar.showMessage(f"PDF 로드됨: {info.page_count} 페이지")
-                self._log(f"PDF 열림: {file_path}")
-
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"PDF 로드 실패: {e}")
-                self._log(f"오류: {e}")
-
-    def _open_settings(self):
-        """설정 다이얼로그 열기"""
-        from .settings_dialog import SettingsDialog
-        dialog = SettingsDialog(self.config, self)
-        if dialog.exec_():
-            self._log("설정이 저장되었습니다")
-
-    def _start_translation(self):
-        """번역 시작"""
-        if not self.current_pdf_path:
-            QMessageBox.warning(self, "경고", "PDF 파일을 먼저 선택하세요")
+        path, _ = QFileDialog.getOpenFileName(self, "PDF 선택", "", "PDF (*.pdf)")
+        if not path:
             return
 
-        if not self.config.config.openai_api_key:
-            QMessageBox.warning(
-                self, "경고",
-                "OpenAI API 키가 설정되지 않았습니다.\n설정 > API 설정에서 입력하세요."
-            )
+        self.pdf_path = path
+        self.file_label.setText(Path(path).name)
+
+        try:
+            with PDFHandler(path) as pdf:
+                info = pdf.get_info()
+                self.page_label.setText(f"총 페이지: {info.page_count}")
+                self.start_spin.setMaximum(info.page_count)
+                self.end_spin.setMaximum(info.page_count)
+                self.start_spin.setValue(1)
+                self.end_spin.setValue(info.page_count)
+
+                # 미리보기
+                img = pdf.render_page(0)
+                self.preview.set_image(img)
+
+            self.start_btn.setEnabled(True)
+            self.statusbar.showMessage(f"로드됨: {info.page_count}페이지")
+            self._log(f"PDF 열림: {path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", str(e))
+
+    def _open_settings(self):
+        from .dialogs import SettingsDialog
+        dlg = SettingsDialog(self.config, self)
+        if dlg.exec_():
+            self._log("설정 저장됨")
+
+    def _start(self):
+        if not self.pdf_path:
+            QMessageBox.warning(self, "경고", "PDF를 먼저 선택하세요")
+            return
+
+        if not self.config.openai_api_key:
+            QMessageBox.warning(self, "경고", "API 키를 설정하세요")
             self._open_settings()
             return
 
-        # 설정 저장
-        self._save_settings()
+        self._save_config()
 
-        # 출력 파일 경로
-        input_path = Path(self.current_pdf_path)
-        output_path = input_path.parent / f"{input_path.stem}_translated.pdf"
-
-        # 저장 위치 선택
+        # 출력 경로
+        inp = Path(self.pdf_path)
+        out = inp.parent / f"{inp.stem}_translated.pdf"
         save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "번역 결과 저장",
-            str(output_path),
-            "PDF Files (*.pdf)"
+            self, "저장", str(out), "PDF (*.pdf)"
         )
-
         if not save_path:
             return
 
-        # 페이지 범위
-        start = self.start_page_spin.value() - 1  # 0-based
-        end = self.end_page_spin.value() - 1
+        self.log_text.clear()
 
-        # 워커 생성 및 시작
-        self.worker = TranslationWorker(
-            self.current_pdf_path,
-            save_path,
-            self.config,
-            (start, end)
+        # OCR 언어
+        ocr_lang = TESSERACT_LANGS.get(self.src_combo.currentText(), "eng")
+
+        # 엔진 생성
+        self.engine = TranslationEngine(
+            api_key=self.config.openai_api_key,
+            model=self.model_combo.currentText(),
+            source_lang=self.src_combo.currentText(),
+            target_lang=self.tgt_combo.currentText(),
+            ocr_lang=ocr_lang,
+            dpi=self.dpi_spin.value(),
+            font_path=self.config.font_path or None,
         )
 
+        # 워커 시작
+        self.worker = Worker(
+            self.engine,
+            self.pdf_path,
+            save_path,
+            self.start_spin.value() - 1,
+            self.end_spin.value() - 1,
+            self.config.ocr_confidence,
+        )
+
+        self.worker.log.connect(self._log)
         self.worker.progress.connect(self._on_progress)
-        self.worker.page_completed.connect(self._on_page_completed)
+        self.worker.image.connect(self._on_image)
         self.worker.finished.connect(self._on_finished)
-        self.worker.error.connect(self._on_error)
 
         self.worker.start()
 
-        # UI 상태 변경
-        self.translate_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self._log("번역 시작...")
 
-    def _cancel_translation(self):
-        """번역 취소"""
-        if self.worker:
-            self.worker.cancel()
-            self._log("취소 요청됨...")
+    def _cancel(self):
+        if self.engine:
+            self.engine.cancel()
+            self._log("취소 요청...")
 
-    def _on_progress(self, value: int, message: str):
-        """진행 상태 업데이트"""
-        self.progress_bar.setValue(value)
-        self.progress_label.setText(message)
-        self.statusbar.showMessage(message)
+    def _on_progress(self, pct: int, msg: str):
+        self.progress_bar.setValue(pct)
+        self.progress_label.setText(msg)
+        self.statusbar.showMessage(msg)
 
-    def _on_page_completed(self, page_num: int, image: Image.Image):
-        """페이지 완료"""
-        self.preview_widget.set_image(image)
-        self._log(f"페이지 {page_num + 1} 완료")
+    def _on_image(self, page: int, img: Image.Image):
+        self.preview.set_image(img)
 
-    def _on_finished(self, success: bool, message: str):
-        """번역 완료"""
-        self.translate_btn.setEnabled(True)
+    def _on_finished(self, success: bool, msg: str):
+        self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
         if success:
-            self._log(message)
-            QMessageBox.information(self, "완료", message)
+            QMessageBox.information(self, "완료", msg)
         else:
-            self._log(f"실패: {message}")
+            QMessageBox.critical(self, "오류", msg)
 
         self.statusbar.showMessage("준비됨")
 
-    def _on_error(self, error_msg: str):
-        """오류 발생"""
-        self._log(f"오류: {error_msg}")
-        QMessageBox.critical(self, "오류", error_msg)
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{ts}] {msg}")
 
-    def _log(self, message: str):
-        """로그 추가"""
-        self.log_text.append(message)
+        if self.auto_scroll.isChecked():
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.log_text.setTextCursor(cursor)
 
-    def closeEvent(self, event):
-        """창 닫기 이벤트"""
+    def closeEvent(self, e):
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
-                self,
-                "확인",
-                "번역이 진행 중입니다. 종료하시겠습니까?",
+                self, "확인", "번역 중입니다. 종료할까요?",
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
-                self.worker.cancel()
+                if self.engine:
+                    self.engine.cancel()
                 self.worker.wait()
-                event.accept()
+                e.accept()
             else:
-                event.ignore()
+                e.ignore()
         else:
-            event.accept()
+            e.accept()

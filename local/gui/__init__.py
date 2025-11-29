@@ -1,7 +1,5 @@
-"""
-GUI modules for PDF Translator Local
-"""
+"""GUI modules"""
 from .main_window import MainWindow
-from .settings_dialog import SettingsDialog
+from .dialogs import SettingsDialog
 
 __all__ = ["MainWindow", "SettingsDialog"]
