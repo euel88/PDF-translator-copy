@@ -14,6 +14,7 @@ import numpy as np
 from pdf2zh.translator import BaseTranslator, create_translator
 from pdf2zh.doclayout import LayoutDetector, LayoutBox, TRANSLATABLE_LABELS
 from pdf2zh.ocr import TesseractOCR, OCRResult, merge_ocr_results
+from pdf2zh.fonts import font_manager, get_font_path
 
 
 # 언어별 줄간격 설정 (PDFMathTranslate 참고)
@@ -80,46 +81,178 @@ class TranslateResult:
 
 
 class FormulaDetector:
-    """수식 감지기"""
+    """수식 감지기 - PDFMathTranslate 수준의 완벽한 LaTeX 보존"""
 
-    # 수식 패턴
-    PATTERNS = [
-        r'\$[^$]+\$',           # LaTeX inline
-        r'\$\$[^$]+\$\$',       # LaTeX block
-        r'\\[\(\[][^\\]*\\[\)\]]',  # LaTeX brackets
-        r'[α-ωΑ-Ω]+',           # Greek letters
-        r'[∑∏∫∂∇√∞∝∀∃∈∉⊂⊃⊆⊇∪∩]+',  # Math symbols
+    # LaTeX 수식 패턴 (우선순위 순서)
+    LATEX_PATTERNS = [
+        # Display math environments
+        r'\\begin\{equation\*?\}.*?\\end\{equation\*?\}',
+        r'\\begin\{align\*?\}.*?\\end\{align\*?\}',
+        r'\\begin\{gather\*?\}.*?\\end\{gather\*?\}',
+        r'\\begin\{multline\*?\}.*?\\end\{multline\*?\}',
+        r'\\begin\{eqnarray\*?\}.*?\\end\{eqnarray\*?\}',
+        r'\\begin\{displaymath\}.*?\\end\{displaymath\}',
+        r'\\begin\{math\}.*?\\end\{math\}',
+        r'\\begin\{array\}.*?\\end\{array\}',
+        r'\\begin\{matrix\}.*?\\end\{matrix\}',
+        r'\\begin\{pmatrix\}.*?\\end\{pmatrix\}',
+        r'\\begin\{bmatrix\}.*?\\end\{bmatrix\}',
+        r'\\begin\{vmatrix\}.*?\\end\{vmatrix\}',
+        r'\\begin\{cases\}.*?\\end\{cases\}',
+        # Block math delimiters
+        r'\$\$[^$]+\$\$',                    # $$ ... $$
+        r'\\\[[^\]]*\\\]',                   # \[ ... \]
+        # Inline math delimiters
+        r'(?<![\\$])\$(?!\$)[^$\n]+\$(?!\$)',  # $ ... $ (not $$)
+        r'\\\([^)]*\\\)',                    # \( ... \)
+        # LaTeX commands with arguments
+        r'\\(?:frac|dfrac|tfrac|cfrac)\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',
+        r'\\(?:sqrt|root)\[[^\]]*\]\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',
+        r'\\(?:sqrt|root)\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',
+        r'\\(?:sum|prod|int|oint|iint|iiint|coprod|bigcup|bigcap|bigoplus|bigotimes)(?:_\{[^{}]*\}|\^[^{}]|_[^{}]|\^\{[^{}]*\})*',
+        r'\\(?:lim|limsup|liminf|sup|inf|max|min)(?:_\{[^{}]*\})*',
+        r'\\(?:vec|hat|bar|tilde|dot|ddot|overline|underline|widehat|widetilde|overrightarrow|overleftarrow)\{[^{}]*\}',
+        r'\\(?:text|mathrm|mathbf|mathit|mathsf|mathtt|mathcal|mathbb|mathfrak|mathscr)\{[^{}]*\}',
+        r'\\(?:left|right|big|Big|bigg|Bigg)[\[\](){}|.]',
+        r'\\(?:binom|tbinom|dbinom)\{[^{}]*\}\{[^{}]*\}',
     ]
+
+    # LaTeX 단일 명령어 (인자 없음)
+    LATEX_COMMANDS = [
+        # Greek letters (lowercase)
+        r'\\(?:alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|tau|upsilon|phi|varphi|chi|psi|omega)',
+        # Greek letters (uppercase)
+        r'\\(?:Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega)',
+        # Binary operators
+        r'\\(?:pm|mp|times|div|cdot|ast|star|circ|bullet|cap|cup|vee|wedge|oplus|ominus|otimes|oslash|odot)',
+        # Relations
+        r'\\(?:leq|geq|le|ge|ll|gg|subset|supset|subseteq|supseteq|in|ni|notin|equiv|sim|simeq|approx|cong|neq|ne|propto|perp|parallel)',
+        # Arrows
+        r'\\(?:leftarrow|rightarrow|leftrightarrow|Leftarrow|Rightarrow|Leftrightarrow|uparrow|downarrow|updownarrow|Uparrow|Downarrow|Updownarrow|mapsto|longmapsto|longleftarrow|longrightarrow|longleftrightarrow|Longleftarrow|Longrightarrow|Longleftrightarrow|nearrow|searrow|swarrow|nwarrow|hookrightarrow|hookleftarrow|leadsto)',
+        # Misc symbols
+        r'\\(?:infty|nabla|partial|forall|exists|nexists|emptyset|varnothing|Re|Im|wp|aleph|hbar|ell|degree|angle|measuredangle|sphericalangle|prime|backprime|triangle|square|diamond|bigcirc|Box)',
+        # Functions
+        r'\\(?:sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|sinh|cosh|tanh|coth|exp|log|ln|lg|arg|det|dim|gcd|hom|ker|Pr|deg)',
+        # Accents and modifiers
+        r'\\(?:prime|backprime|acute|grave|breve|check|dot|ddot|dddot|ddddot|hat|widehat|tilde|widetilde|bar|overline|underline|overbrace|underbrace|vec|overrightarrow|overleftarrow)',
+        # Spacing
+        r'\\(?:quad|qquad|,|;|:|!|enspace|thinspace|medspace|thickspace|negthickspace|negmedspace|negthinspace)',
+        # Delimiters
+        r'\\(?:lbrace|rbrace|langle|rangle|lfloor|rfloor|lceil|rceil|vert|Vert|lVert|rVert|backslash)',
+        # Dots
+        r'\\(?:ldots|cdots|vdots|ddots|dots|dotsc|dotsb|dotsm|dotsi|dotso)',
+    ]
+
+    # Unicode 수학 기호
+    MATH_SYMBOLS = r'[∑∏∫∬∭∮∯∰∂∇√∛∜∞∝∀∃∄∈∉∋∌⊂⊃⊆⊇⊄⊅∪∩⊕⊖⊗⊘⊙⊚⊛⊜⊝∅∆∧∨¬⊥∥≡≢≈≉≠≤≥≪≫≲≳≺≻≼≽⊀⊁⊰⊱⊲⊳⊴⊵←→↑↓↔↕⇐⇒⇑⇓⇔⇕↦↤⟨⟩⌈⌉⌊⌋⟦⟧⟪⟫′″‴⁗±∓×÷·⋅∗∘∙⊡⊞⊟⊠∧∨⊼⊽⊻△▽□◇○◎●∎∴∵∶∷∸∹∺∻]+'
+
+    # Greek letters (Unicode)
+    GREEK_LETTERS = r'[αβγδεζηθικλμνξοπρστυφχψωΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩϑϕϖϱϵ]+'
+
+    # Subscripts and superscripts
+    SUBSCRIPT_SUPERSCRIPT = r'[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁱⁿ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₔₕₖₗₘₙₚₛₜ]+'
 
     @classmethod
     def is_formula(cls, text: str) -> bool:
-        """텍스트가 수식인지 확인"""
-        for pattern in cls.PATTERNS:
+        """텍스트가 수식인지 확인 (더 정밀한 감지)"""
+        text = text.strip()
+        if not text:
+            return False
+
+        # LaTeX 환경 체크
+        for pattern in cls.LATEX_PATTERNS:
+            if re.search(pattern, text, re.DOTALL):
+                return True
+
+        # LaTeX 명령어 체크
+        for pattern in cls.LATEX_COMMANDS:
             if re.search(pattern, text):
                 return True
-        # 숫자/기호 비율 체크
-        alpha_count = sum(1 for c in text if c.isalpha())
-        total = len(text.replace(" ", ""))
-        if total > 0 and alpha_count / total < 0.3:
+
+        # 수학 기호 체크
+        if re.search(cls.MATH_SYMBOLS, text):
             return True
+
+        # Greek letters 체크
+        if re.search(cls.GREEK_LETTERS, text):
+            # Greek letters만 있는 경우 수식으로 간주
+            greek_count = len(re.findall(cls.GREEK_LETTERS, text))
+            alpha_count = sum(1 for c in text if c.isalpha())
+            if greek_count > 0 and greek_count >= alpha_count * 0.3:
+                return True
+
+        # Subscript/superscript 체크
+        if re.search(cls.SUBSCRIPT_SUPERSCRIPT, text):
+            return True
+
+        # 수식 특성 분석: 숫자, 연산자, 변수의 조합
+        operators = set('+-*/=<>≤≥≠≈∈∉⊂⊃')
+        has_number = any(c.isdigit() for c in text)
+        has_operator = any(c in operators for c in text)
+        single_letters = re.findall(r'\b[a-zA-Z]\b', text)
+
+        if has_number and has_operator and len(single_letters) >= 2:
+            # 가능성 높은 수식 (예: "x + y = 5")
+            return True
+
+        # 순수 숫자+연산자 조합
+        clean = re.sub(r'\s', '', text)
+        if clean and all(c.isdigit() or c in '+-*/=.^_()[]{}' for c in clean):
+            if len(clean) >= 3 and any(c in '+-*/=^_' for c in clean):
+                return True
+
         return False
 
     @classmethod
     def extract_formulas(cls, text: str) -> Tuple[str, List[str]]:
-        """수식 추출 및 플레이스홀더 적용"""
+        """수식 추출 및 플레이스홀더 적용 - 개선된 버전"""
         formulas = []
         result = text
+        used_positions = set()
 
-        for pattern in cls.PATTERNS:
-            matches = list(re.finditer(pattern, result))
-            for match in reversed(matches):
-                formula = match.group()
-                idx = len(formulas)
-                placeholder = f"{{{{v{idx}}}}}"
-                formulas.append(formula)
-                result = result[:match.start()] + placeholder + result[match.end():]
+        def add_formula(match_start: int, match_end: int, formula: str):
+            """중복 방지하며 수식 추가"""
+            # 이미 처리된 위치인지 확인
+            for pos_start, pos_end in used_positions:
+                if not (match_end <= pos_start or match_start >= pos_end):
+                    return False
+            used_positions.add((match_start, match_end))
+            formulas.append((match_start, match_end, formula))
+            return True
 
-        return result, formulas
+        # 1. LaTeX 환경과 수식 먼저 추출
+        for pattern in cls.LATEX_PATTERNS:
+            for match in re.finditer(pattern, text, re.DOTALL):
+                add_formula(match.start(), match.end(), match.group())
+
+        # 2. LaTeX 명령어 추출
+        for pattern in cls.LATEX_COMMANDS:
+            for match in re.finditer(pattern, text):
+                add_formula(match.start(), match.end(), match.group())
+
+        # 3. Unicode 수학 기호 추출
+        for match in re.finditer(cls.MATH_SYMBOLS, text):
+            add_formula(match.start(), match.end(), match.group())
+
+        # 4. Greek letters 추출
+        for match in re.finditer(cls.GREEK_LETTERS, text):
+            add_formula(match.start(), match.end(), match.group())
+
+        # 5. Subscripts/superscripts 추출
+        for match in re.finditer(cls.SUBSCRIPT_SUPERSCRIPT, text):
+            add_formula(match.start(), match.end(), match.group())
+
+        # 정렬 후 역순으로 플레이스홀더 적용 (위치 변경 방지)
+        formulas.sort(key=lambda x: x[0], reverse=True)
+
+        formula_list = []
+        for start, end, formula in formulas:
+            idx = len(formula_list)
+            placeholder = f"{{{{v{idx}}}}}"
+            result = result[:start] + placeholder + result[end:]
+            formula_list.insert(0, formula)  # 원래 순서 유지
+
+        return result, formula_list
 
     @classmethod
     def restore_formulas(cls, text: str, formulas: List[str]) -> str:
@@ -127,7 +260,45 @@ class FormulaDetector:
         result = text
         for idx, formula in enumerate(formulas):
             placeholder = f"{{{{v{idx}}}}}"
-            result = result.replace(placeholder, formula)
+            # 번역 과정에서 변형될 수 있는 플레이스홀더 변형들도 처리
+            variations = [
+                placeholder,
+                f"{{v{idx}}}",          # 단일 중괄호
+                f"{{ v{idx} }}",        # 공백 추가
+                f"{{{{v{idx} }}}}",     # 뒤 공백
+                f"{{{{ v{idx}}}}}",     # 앞 공백
+                f"v{idx}",              # 중괄호 제거
+                f"[v{idx}]",            # 대괄호로 변형
+                f"(v{idx})",            # 소괄호로 변형
+            ]
+            for var in variations:
+                if var in result:
+                    result = result.replace(var, formula)
+                    break
+        return result
+
+    @classmethod
+    def protect_formulas_for_translation(cls, text: str) -> Tuple[str, Dict[str, str]]:
+        """
+        번역을 위해 수식을 보호하는 고급 메서드
+        수식을 XML-like 태그로 감싸서 번역기가 무시하도록 함
+        """
+        protected_text, formulas = cls.extract_formulas(text)
+        formula_map = {}
+
+        for idx, formula in enumerate(formulas):
+            key = f"__FORMULA_{idx}__"
+            protected_text = protected_text.replace(f"{{{{v{idx}}}}}", key)
+            formula_map[key] = formula
+
+        return protected_text, formula_map
+
+    @classmethod
+    def unprotect_formulas(cls, text: str, formula_map: Dict[str, str]) -> str:
+        """보호된 수식 복원"""
+        result = text
+        for key, formula in formula_map.items():
+            result = result.replace(key, formula)
         return result
 
 
@@ -175,7 +346,13 @@ class PDFConverter:
         self.ocr_engine = TesseractOCR(source_lang) if use_ocr else None
 
     def _find_font_file(self) -> Optional[str]:
-        """시스템에서 사용 가능한 폰트 파일 찾기"""
+        """시스템에서 사용 가능한 폰트 파일 찾기 - Go Noto Universal 우선"""
+        # 새로운 폰트 관리자 사용 (Go Noto Universal 우선)
+        font_path = get_font_path(self.target_lang)
+        if font_path:
+            return font_path
+
+        # 폴백: 기존 시스템 폰트 검색
         import sys
         if sys.platform == "win32":
             paths = FONT_PATHS["windows"]
