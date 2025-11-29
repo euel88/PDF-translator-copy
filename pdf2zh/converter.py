@@ -16,6 +16,34 @@ from pdf2zh.doclayout import LayoutDetector, LayoutBox, TRANSLATABLE_LABELS
 from pdf2zh.ocr import TesseractOCR, OCRResult, merge_ocr_results
 
 
+# 언어별 줄간격 설정 (PDFMathTranslate 참고)
+LANG_LINEHEIGHT_MAP = {
+    "zh-cn": 1.4, "zh-tw": 1.4, "zh": 1.4,
+    "ja": 1.1, "jp": 1.1,
+    "ko": 1.2, "kr": 1.2,
+    "en": 1.2, "eng": 1.2,
+    "de": 1.2, "fr": 1.2, "es": 1.2,
+}
+
+# 폰트 파일 경로 (시스템별)
+FONT_PATHS = {
+    "windows": [
+        r"C:\Windows\Fonts\malgun.ttf",      # 맑은 고딕
+        r"C:\Windows\Fonts\NanumGothic.ttf",
+        r"C:\Windows\Fonts\gulim.ttc",
+    ],
+    "linux": [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+    "darwin": [
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/Library/Fonts/NanumGothic.ttf",
+    ],
+}
+
+
 @dataclass
 class TextBlock:
     """텍스트 블록"""
@@ -114,6 +142,7 @@ class PDFConverter:
         use_layout_detection: bool = False,
         use_ocr: bool = False,
         source_lang: str = "eng",
+        target_lang: str = "ko",  # 대상 언어 추가
         # 최적화 옵션
         output_quality: int = 85,  # JPEG 품질 (1-100)
         use_vector_text: bool = True,  # 벡터 텍스트 사용 (파일 크기 대폭 감소)
@@ -125,6 +154,7 @@ class PDFConverter:
         self.use_layout_detection = use_layout_detection
         self.use_ocr = use_ocr
         self.source_lang = source_lang
+        self.target_lang = target_lang
         self._cancelled = False
 
         # 최적화 옵션
@@ -132,11 +162,32 @@ class PDFConverter:
         self.use_vector_text = use_vector_text
         self.compress_images = compress_images
 
+        # 언어별 줄간격
+        self.line_height = LANG_LINEHEIGHT_MAP.get(target_lang.lower(), 1.2)
+
+        # 외부 폰트 파일 경로 찾기
+        self.font_file = self._find_font_file()
+
         # 레이아웃 감지기
         self.layout_detector = LayoutDetector() if use_layout_detection else None
 
         # OCR 엔진
         self.ocr_engine = TesseractOCR(source_lang) if use_ocr else None
+
+    def _find_font_file(self) -> Optional[str]:
+        """시스템에서 사용 가능한 폰트 파일 찾기"""
+        import sys
+        if sys.platform == "win32":
+            paths = FONT_PATHS["windows"]
+        elif sys.platform == "darwin":
+            paths = FONT_PATHS["darwin"]
+        else:
+            paths = FONT_PATHS["linux"]
+
+        for path in paths:
+            if Path(path).exists():
+                return path
+        return None
 
     def cancel(self):
         """변환 취소"""
@@ -225,6 +276,9 @@ class PDFConverter:
             output_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
             new_page = output_doc[-1]
 
+            # 배경색 감지를 위한 페이지 렌더링
+            page_pixmap = page.get_pixmap(matrix=fitz.Matrix(1, 1))
+
             # 텍스트 블록 추출
             blocks = self._extract_blocks_for_vector(page)
             self._log(f"  텍스트 블록: {len(blocks)}개")
@@ -247,6 +301,7 @@ class PDFConverter:
                 texts.append(text)
                 formulas_map[i] = formulas
 
+            self._log(f"  번역 중... ({len(texts)}개 블록)")
             translations = self.translator.translate_batch(texts)
 
             # 수식 복원
@@ -254,8 +309,8 @@ class PDFConverter:
                 if i in formulas_map and formulas_map[i]:
                     translations[i] = FormulaDetector.restore_formulas(trans, formulas_map[i])
 
-            # 벡터 텍스트 교체
-            self._replace_text_vector(new_page, to_translate, translations)
+            # 벡터 텍스트 교체 (배경색 감지용 pixmap 전달)
+            self._replace_text_vector(new_page, to_translate, translations, page_pixmap)
 
         # 압축 옵션으로 저장
         output = io.BytesIO()
@@ -325,33 +380,53 @@ class PDFConverter:
         self,
         page: fitz.Page,
         blocks: List[TextBlock],
-        translations: List[str]
+        translations: List[str],
+        page_pixmap: Optional[fitz.Pixmap] = None
     ):
-        """벡터 방식으로 텍스트 교체 - PyMuPDF 사용"""
+        """벡터 방식으로 텍스트 교체 - PyMuPDF 사용, 원본 레이아웃 최대 보존"""
+
+        # 외부 폰트 등록 (한글 지원)
+        font_registered = False
+        font_xref = None
+        if self.font_file and Path(self.font_file).exists():
+            try:
+                font_xref = page.insert_font(
+                    fontfile=self.font_file,
+                    fontname="korean-font"
+                )
+                font_registered = True
+            except Exception:
+                pass
+
         for block, translation in zip(blocks, translations):
             x0, y0, x1, y1 = block.bbox
             rect = fitz.Rect(x0, y0, x1, y1)
 
-            # 원본 텍스트 영역을 흰색으로 덮기
-            # 배경색 감지를 위한 간단한 휴리스틱 (대부분 흰색)
-            page.draw_rect(rect, color=None, fill=(1, 1, 1))
+            # 배경색 감지 (페이지 렌더링에서)
+            bg_color = self._detect_bg_color_from_pixmap(page_pixmap, rect) if page_pixmap else (1, 1, 1)
+
+            # 원본 텍스트 영역을 배경색으로 덮기 (약간 확장)
+            pad = 1
+            cover_rect = fitz.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+            page.draw_rect(cover_rect, color=None, fill=bg_color)
 
             # 번역된 텍스트 삽입
-            # 폰트 크기 조정 (번역 텍스트가 더 길 수 있음)
             font_size = block.font_size
             text_color = tuple(c / 255 for c in block.color)
 
-            # 폰트 선택 (한글 지원)
-            fontname = self._get_vector_fontname(block.font_name)
+            # 폰트 선택
+            if font_registered:
+                fontname = "korean-font"
+            else:
+                fontname = self._get_vector_fontname(block.font_name)
 
-            # 텍스트가 박스에 맞도록 크기 조정
-            adjusted_size, fitted_text = self._fit_text_vector(
+            # 텍스트 맞춤 (원본 크기 유지 시도, 필요시 축소)
+            adjusted_size, fitted_text = self._fit_text_vector_improved(
                 page, translation, rect, font_size, fontname
             )
 
-            # 텍스트 삽입
+            # 텍스트 삽입 (줄간격 적용)
             try:
-                # 텍스트 박스로 삽입 (자동 줄바꿈)
                 page.insert_textbox(
                     rect,
                     fitted_text,
@@ -359,6 +434,7 @@ class PDFConverter:
                     fontname=fontname,
                     color=text_color,
                     align=fitz.TEXT_ALIGN_LEFT,
+                    lineheight=self.line_height,
                 )
             except Exception:
                 # 폴백: 기본 폰트 사용
@@ -372,7 +448,85 @@ class PDFConverter:
                         align=fitz.TEXT_ALIGN_LEFT,
                     )
                 except Exception:
-                    pass  # 실패해도 계속 진행
+                    pass
+
+    def _detect_bg_color_from_pixmap(
+        self,
+        pixmap: fitz.Pixmap,
+        rect: fitz.Rect
+    ) -> Tuple[float, float, float]:
+        """Pixmap에서 영역의 배경색 감지"""
+        try:
+            # 영역 주변 샘플링
+            x0, y0, x1, y1 = int(rect.x0), int(rect.y0), int(rect.x1), int(rect.y1)
+
+            # 상단 가장자리에서 샘플링
+            samples = []
+            for x in range(max(0, x0), min(pixmap.width, x1), 5):
+                if y0 > 2:
+                    # 상단 2픽셀 위에서 샘플
+                    idx = ((y0 - 2) * pixmap.width + x) * pixmap.n
+                    if idx + 2 < len(pixmap.samples):
+                        r, g, b = pixmap.samples[idx:idx+3]
+                        samples.append((r, g, b))
+
+            if samples:
+                # 중간값 사용
+                r = sorted([s[0] for s in samples])[len(samples)//2]
+                g = sorted([s[1] for s in samples])[len(samples)//2]
+                b = sorted([s[2] for s in samples])[len(samples)//2]
+                return (r/255, g/255, b/255)
+        except Exception:
+            pass
+
+        return (1, 1, 1)  # 기본 흰색
+
+    def _fit_text_vector_improved(
+        self,
+        page: fitz.Page,
+        text: str,
+        rect: fitz.Rect,
+        font_size: float,
+        fontname: str
+    ) -> Tuple[float, str]:
+        """개선된 텍스트 맞춤 - 원본 크기 최대한 유지"""
+        min_size = 6
+        # 원본 크기의 90%부터 시작 (번역 텍스트가 보통 더 김)
+        current_size = font_size * 0.9
+
+        # 박스 높이/너비 비율에 따른 초기 조정
+        box_width = rect.width
+        box_height = rect.height
+        text_len = len(text)
+
+        # 대략적인 글자당 너비 추정 (한글은 약 0.9배)
+        est_char_width = current_size * 0.5
+        est_text_width = text_len * est_char_width
+
+        # 텍스트가 너무 길면 미리 크기 조정
+        if est_text_width > box_width * 2:
+            ratio = (box_width * 1.5) / est_text_width
+            current_size = max(min_size, current_size * ratio)
+
+        while current_size >= min_size:
+            try:
+                rc = page.insert_textbox(
+                    rect,
+                    text,
+                    fontsize=current_size,
+                    fontname=fontname,
+                    lineheight=self.line_height,
+                    overlay=False,
+                )
+                if rc >= 0:
+                    return current_size, text
+            except Exception:
+                pass
+
+            # 더 작은 단계로 축소 (10%씩)
+            current_size = current_size * 0.9
+
+        return min_size, text
 
     def _get_vector_fontname(self, font_name: str) -> str:
         """벡터 텍스트용 폰트 이름 반환"""
@@ -386,38 +540,6 @@ class PDFConverter:
             return "china-s"
         else:
             return "china-s"  # 기본적으로 CJK 폰트 사용
-
-    def _fit_text_vector(
-        self,
-        page: fitz.Page,
-        text: str,
-        rect: fitz.Rect,
-        font_size: float,
-        fontname: str
-    ) -> Tuple[float, str]:
-        """벡터 텍스트를 박스에 맞게 조정"""
-        min_size = 6
-        current_size = font_size
-
-        while current_size >= min_size:
-            # 텍스트 맞춤 테스트
-            try:
-                rc = page.insert_textbox(
-                    rect,
-                    text,
-                    fontsize=current_size,
-                    fontname=fontname,
-                    overlay=False,  # 실제 삽입하지 않음 (테스트만)
-                )
-                if rc >= 0:  # 성공
-                    return current_size, text
-            except Exception:
-                pass
-
-            current_size = int(current_size * 0.85)
-
-        # 최소 크기로 시도
-        return min_size, text
 
     def _convert_image_mode(
         self,

@@ -88,6 +88,7 @@ def translate(
         return _translate_pdf(
             input_path, output_path, translator,
             pages, dpi, callback,
+            target_lang=tgt_code,
             output_quality=output_quality,
             use_vector_text=use_vector_text,
             compress_images=compress_images,
@@ -106,6 +107,7 @@ def _translate_pdf(
     pages: Optional[List[int]],
     dpi: int,
     callback: Optional[Callable[[str], None]],
+    target_lang: str = "ko",
     output_quality: int = 85,
     use_vector_text: bool = True,
     compress_images: bool = True,
@@ -121,6 +123,7 @@ def _translate_pdf(
         translator=translator,
         dpi=dpi,
         callback=callback,
+        target_lang=target_lang,
         output_quality=output_quality,
         use_vector_text=use_vector_text,
         compress_images=compress_images,
