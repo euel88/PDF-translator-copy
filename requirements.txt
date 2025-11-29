@@ -8,11 +8,16 @@ Pillow>=10.0.0
 # GUI
 PyQt5>=5.15.0
 
-# 번역 서비스
+# 번역 서비스 - 기본
 openai>=1.0.0
 deep-translator>=1.11.0
 deepl>=1.16.0
 ollama>=0.1.0
+
+# 번역 서비스 - 추가 (선택적)
+anthropic>=0.18.0           # Claude
+google-generativeai>=0.4.0  # Gemini
+requests>=2.31.0            # Azure, Papago
 
 # 레이아웃 감지 (선택)
 onnxruntime>=1.16.0
@@ -23,8 +28,14 @@ opencv-python>=4.8.0
 
 # 백엔드 서버 (선택)
 flask>=3.0.0
+gunicorn>=21.0.0            # 프로덕션 서버
+celery>=5.3.0               # 비동기 작업
+redis>=5.0.0                # Celery 브로커
 
 # 문서 처리 (Word, Excel, PowerPoint)
 python-docx>=1.1.0
 openpyxl>=3.1.0
 python-pptx>=0.6.23
+
+# MCP 서버 (Claude Desktop 통합)
+# mcp>=0.1.0  # 사용 시 주석 해제

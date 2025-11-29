@@ -2,6 +2,7 @@
 """
 PDF Translator - 메인 진입점
 PDFMathTranslate 구조 기반
+완전한 CLI, GUI, 서버 모드 지원
 """
 import sys
 import os
@@ -19,11 +20,6 @@ def check_dependencies():
         import fitz
     except ImportError:
         missing.append("PyMuPDF")
-
-    try:
-        import PyQt5
-    except ImportError:
-        missing.append("PyQt5")
 
     try:
         from PIL import Image
@@ -71,43 +67,19 @@ def main():
 
     setup_tesseract()
 
-    # 명령줄 인자 처리
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if arg in ["--cli", "-c"]:
-            # CLI 모드
-            from pdf2zh.high_level import main as cli_main
-            cli_main()
-        elif arg in ["--help", "-h"]:
-            print("PDF Translator")
-            print()
-            print("사용법:")
-            print("  python pdf2zh.py          GUI 실행")
-            print("  python pdf2zh.py --cli    CLI 모드")
-            print("  python pdf2zh.py input.pdf  파일 직접 번역")
-            print()
-            print("옵션:")
-            print("  -h, --help    도움말 표시")
-            print("  -c, --cli     CLI 모드")
-        else:
-            # 파일 경로로 간주
-            if os.path.exists(sys.argv[1]):
-                from pdf2zh.high_level import translate
-                result = translate(
-                    input_path=sys.argv[1],
-                    callback=print,
-                )
-                if result.success:
-                    print(f"\n완료: {result.output_path}")
-                else:
-                    print(f"\n오류: {result.error}")
-            else:
-                print(f"파일을 찾을 수 없습니다: {sys.argv[1]}")
-                sys.exit(1)
+    # 명령줄 인자가 없으면 GUI 실행
+    if len(sys.argv) == 1:
+        try:
+            from pdf2zh.gui import run_gui
+            run_gui()
+        except ImportError:
+            print("GUI 실행 실패. CLI 모드를 사용하세요:")
+            print("  python pdf2zh.py --help")
+            sys.exit(1)
     else:
-        # GUI 모드
-        from pdf2zh.gui import run_gui
-        run_gui()
+        # CLI 모드
+        from pdf2zh.cli import main as cli_main
+        sys.exit(cli_main())
 
 
 if __name__ == "__main__":

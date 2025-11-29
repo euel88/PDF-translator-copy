@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # PDF Translator REST API 서버
+  pdf-translator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdf-translator:latest
+    container_name: pdf-translator
+    ports:
+      - "5000:5000"
+    volumes:
+      # 입출력 파일 마운트
+      - ./data/input:/app/input
+      - ./data/output:/app/output
+      # 캐시 영속화
+      - pdf-cache:/root/.cache/PDFTranslator
+      - font-cache:/root/.cache/pdf2zh
+    environment:
+      # 번역 서비스 API 키 (환경 변수로 전달)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DEEPL_API_KEY=${DEEPL_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - AZURE_TRANSLATOR_KEY=${AZURE_TRANSLATOR_KEY:-}
+      - AZURE_TRANSLATOR_REGION=${AZURE_TRANSLATOR_REGION:-global}
+      - PAPAGO_CLIENT_ID=${PAPAGO_CLIENT_ID:-}
+      - PAPAGO_CLIENT_SECRET=${PAPAGO_CLIENT_SECRET:-}
+      # Ollama/Xinference 호스트 (다른 컨테이너 사용 시)
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - XINFERENCE_HOST=${XINFERENCE_HOST:-http://xinference:9997}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - pdf-network
+
+  # Redis (Celery 백엔드용 - 선택적)
+  redis:
+    image: redis:7-alpine
+    container_name: pdf-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - pdf-network
+    profiles:
+      - celery
+
+  # Celery Worker (비동기 처리용 - 선택적)
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdf-translator:latest
+    container_name: pdf-celery-worker
+    command: celery -A pdf2zh.backend.celery_app worker --loglevel=info
+    volumes:
+      - ./data/input:/app/input
+      - ./data/output:/app/output
+      - pdf-cache:/root/.cache/PDFTranslator
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - pdf-network
+    profiles:
+      - celery
+
+  # Ollama (로컬 LLM - 선택적)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pdf-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - pdf-network
+    profiles:
+      - ollama
+    # GPU 지원 (NVIDIA)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  pdf-network:
+    driver: bridge
+
+volumes:
+  pdf-cache:
+  font-cache:
+  redis-data:
+  ollama-data:
