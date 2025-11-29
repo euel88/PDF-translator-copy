@@ -59,6 +59,10 @@ class TranslatorThread(threading.Thread):
                 pages=self.params.get("pages"),
                 dpi=self.params.get("dpi", 150),
                 callback=callback,
+                # 최적화 옵션
+                use_vector_text=self.params.get("use_vector_text", True),
+                compress_images=self.params.get("compress_images", True),
+                output_quality=self.params.get("output_quality", 85),
                 **self.params.get("kwargs", {})
             )
 
@@ -215,6 +219,43 @@ class MainWindow(QMainWindow):
         trans_layout.addRow("DPI (PDF):", self.dpi)
 
         layout.addWidget(trans_group)
+
+        # 최적화 설정 (PDF)
+        opt_group = QGroupBox("PDF 최적화")
+        opt_layout = QFormLayout(opt_group)
+
+        # 벡터 텍스트 사용
+        self.use_vector_text = QCheckBox("벡터 텍스트 사용 (권장)")
+        self.use_vector_text.setChecked(True)
+        self.use_vector_text.setToolTip(
+            "원본 PDF 구조를 유지하면서 텍스트만 교체합니다.\n"
+            "파일 크기가 원본과 비슷하게 유지됩니다."
+        )
+        self.use_vector_text.stateChanged.connect(self._on_vector_mode_changed)
+        opt_layout.addRow("렌더링:", self.use_vector_text)
+
+        # 이미지 압축
+        self.compress_images = QCheckBox("이미지 압축 (JPEG)")
+        self.compress_images.setChecked(True)
+        self.compress_images.setToolTip(
+            "이미지 모드에서 PNG 대신 JPEG로 압축합니다.\n"
+            "파일 크기가 크게 감소합니다."
+        )
+        opt_layout.addRow("압축:", self.compress_images)
+
+        # JPEG 품질
+        quality_layout = QHBoxLayout()
+        self.output_quality = QSpinBox()
+        self.output_quality.setMinimum(10)
+        self.output_quality.setMaximum(100)
+        self.output_quality.setValue(85)
+        self.output_quality.setSuffix("%")
+        self.output_quality.setToolTip("JPEG 품질 (높을수록 품질 좋음, 파일 크기 증가)")
+        quality_layout.addWidget(self.output_quality)
+        quality_layout.addStretch()
+        opt_layout.addRow("이미지 품질:", quality_layout)
+
+        layout.addWidget(opt_group)
 
         # 버튼
         btn_layout = QHBoxLayout()
@@ -376,10 +417,19 @@ class MainWindow(QMainWindow):
         self.page_start.setEnabled(is_pdf)
         self.page_end.setEnabled(is_pdf)
         self.dpi.setEnabled(is_pdf)
+        self.use_vector_text.setEnabled(is_pdf)
+        self.compress_images.setEnabled(is_pdf)
+        self.output_quality.setEnabled(is_pdf)
 
         if not is_pdf:
             self.page_start.setValue(0)
             self.page_end.setValue(0)
+
+    def _on_vector_mode_changed(self, state: int):
+        """벡터 모드 변경 시 이미지 옵션 활성화/비활성화"""
+        is_image_mode = state != Qt.Checked
+        self.compress_images.setEnabled(is_image_mode)
+        self.output_quality.setEnabled(is_image_mode and self.compress_images.isChecked())
 
     def on_service_changed(self, service: str):
         """서비스 변경 시"""
@@ -431,6 +481,10 @@ class MainWindow(QMainWindow):
             "service": service,
             "pages": pages,
             "dpi": self.dpi.value(),
+            # 최적화 옵션
+            "use_vector_text": self.use_vector_text.isChecked(),
+            "compress_images": self.compress_images.isChecked(),
+            "output_quality": self.output_quality.value(),
             "kwargs": kwargs,
         }
 
