@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Any
 from PIL import Image
 import fitz  # PyMuPDF
+import numpy as np
 
 from pdf2zh.translator import BaseTranslator, create_translator
+from pdf2zh.doclayout import LayoutDetector, LayoutBox, TRANSLATABLE_LABELS
+from pdf2zh.ocr import TesseractOCR, OCRResult, merge_ocr_results
 
 
 @dataclass
@@ -108,11 +111,23 @@ class PDFConverter:
         translator: BaseTranslator,
         dpi: int = 150,
         callback: Optional[Callable[[str], None]] = None,
+        use_layout_detection: bool = False,
+        use_ocr: bool = False,
+        source_lang: str = "eng",
     ):
         self.translator = translator
         self.dpi = dpi
         self.callback = callback
+        self.use_layout_detection = use_layout_detection
+        self.use_ocr = use_ocr
+        self.source_lang = source_lang
         self._cancelled = False
+
+        # 레이아웃 감지기
+        self.layout_detector = LayoutDetector() if use_layout_detection else None
+
+        # OCR 엔진
+        self.ocr_engine = TesseractOCR(source_lang) if use_ocr else None
 
     def cancel(self):
         """변환 취소"""
@@ -163,8 +178,14 @@ class PDFConverter:
                 page = doc[page_num]
                 img = self._render_page(page)
 
+                # 레이아웃 감지 (옵션)
+                layout_boxes = None
+                if self.layout_detector:
+                    layout_boxes = self.layout_detector.detect(img)
+                    self._log(f"  레이아웃 영역: {len(layout_boxes)}개")
+
                 # 텍스트 추출
-                blocks = self._extract_blocks(page)
+                blocks = self._extract_blocks(page, img, layout_boxes)
                 self._log(f"  텍스트 블록: {len(blocks)}개")
 
                 if blocks:
@@ -202,12 +223,19 @@ class PDFConverter:
         pix = page.get_pixmap(matrix=mat, alpha=False)
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-    def _extract_blocks(self, page: fitz.Page) -> List[TextBlock]:
+    def _extract_blocks(
+        self,
+        page: fitz.Page,
+        img: Optional[Image.Image] = None,
+        layout_boxes: Optional[List[LayoutBox]] = None
+    ) -> List[TextBlock]:
         """페이지에서 텍스트 블록 추출"""
         blocks = []
         scale = self.dpi / 72
 
+        # PDF 구조에서 텍스트 추출
         page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        has_text = False
 
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:  # text only
@@ -222,6 +250,7 @@ class PDFConverter:
                     if text:
                         line_text += text + " "
                         line_spans.append(span)
+                        has_text = True
 
                 line_text = line_text.strip()
                 if not line_text or len(line_text) < 2:
@@ -232,6 +261,13 @@ class PDFConverter:
                 y0 = min(s["bbox"][1] for s in line_spans) * scale
                 x1 = max(s["bbox"][2] for s in line_spans) * scale
                 y1 = max(s["bbox"][3] for s in line_spans) * scale
+
+                # 레이아웃 필터링
+                if layout_boxes:
+                    if not self._is_in_translatable_region(
+                        (x0, y0, x1, y1), layout_boxes
+                    ):
+                        continue
 
                 first = line_spans[0]
                 font_size = first.get("size", 12) * scale
@@ -253,7 +289,77 @@ class PDFConverter:
                     is_formula=is_formula,
                 ))
 
+        # OCR 폴백 (텍스트가 없는 스캔 PDF)
+        if not has_text and self.ocr_engine and img:
+            blocks = self._extract_blocks_ocr(img, layout_boxes)
+
         return blocks
+
+    def _extract_blocks_ocr(
+        self,
+        img: Image.Image,
+        layout_boxes: Optional[List[LayoutBox]] = None
+    ) -> List[TextBlock]:
+        """OCR로 텍스트 블록 추출"""
+        blocks = []
+
+        # 레이아웃 영역별 OCR 또는 전체 이미지
+        if layout_boxes:
+            translatable = [b for b in layout_boxes if b.label in TRANSLATABLE_LABELS]
+            for box in translatable:
+                ocr_results = self.ocr_engine.recognize(img, box.bbox)
+                merged = merge_ocr_results(ocr_results)
+
+                for result in merged:
+                    if len(result.text) < 2:
+                        continue
+
+                    blocks.append(TextBlock(
+                        text=result.text,
+                        bbox=result.bbox,
+                        font_size=14,  # OCR은 폰트 정보 없음
+                        font_name="",
+                        color=(0, 0, 0),
+                        is_formula=FormulaDetector.is_formula(result.text),
+                    ))
+        else:
+            ocr_results = self.ocr_engine.recognize(img)
+            merged = merge_ocr_results(ocr_results)
+
+            for result in merged:
+                if len(result.text) < 2:
+                    continue
+
+                blocks.append(TextBlock(
+                    text=result.text,
+                    bbox=result.bbox,
+                    font_size=14,
+                    font_name="",
+                    color=(0, 0, 0),
+                    is_formula=FormulaDetector.is_formula(result.text),
+                ))
+
+        return blocks
+
+    def _is_in_translatable_region(
+        self,
+        bbox: Tuple[float, float, float, float],
+        layout_boxes: List[LayoutBox]
+    ) -> bool:
+        """번역 가능 영역 내에 있는지 확인"""
+        x0, y0, x1, y1 = bbox
+        center_x = (x0 + x1) / 2
+        center_y = (y0 + y1) / 2
+
+        for box in layout_boxes:
+            if box.label not in TRANSLATABLE_LABELS:
+                continue
+
+            if (box.x0 <= center_x <= box.x1 and
+                box.y0 <= center_y <= box.y1):
+                return True
+
+        return True  # 레이아웃 감지 실패 시 번역
 
     def _translate_page(
         self,
