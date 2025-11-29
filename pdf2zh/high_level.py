@@ -1,14 +1,82 @@
 """
 고수준 API - PDFMathTranslate 구조 기반
 다양한 문서 형식 지원 (PDF, Word, Excel, PowerPoint)
+URL 직접 번역, 이중 언어 출력 지원
 """
 import io
+import os
+import re
+import tempfile
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional, List, Callable, BinaryIO, Union
 
 from pdf2zh.converter import PDFConverter, TranslateResult
 from pdf2zh.translator import create_translator, BaseTranslator
 from pdf2zh.config import LANGUAGES
+
+
+def is_url(path: str) -> bool:
+    """URL인지 확인"""
+    return path.startswith(('http://', 'https://'))
+
+
+def download_pdf_from_url(url: str, callback: Optional[Callable[[str], None]] = None) -> str:
+    """
+    URL에서 PDF 다운로드 (arxiv, 일반 PDF URL 지원)
+
+    Args:
+        url: PDF URL (arxiv 링크도 지원)
+        callback: 로그 콜백
+
+    Returns:
+        임시 파일 경로
+    """
+    def log(msg: str):
+        if callback:
+            callback(msg)
+
+    # arxiv URL 처리
+    # https://arxiv.org/abs/2301.00001 -> https://arxiv.org/pdf/2301.00001.pdf
+    if 'arxiv.org/abs/' in url:
+        url = url.replace('/abs/', '/pdf/') + '.pdf'
+        log(f"arxiv URL 변환: {url}")
+    elif 'arxiv.org' in url and not url.endswith('.pdf'):
+        # arxiv.org/pdf/2301.00001 형식일 수 있음
+        if not url.endswith('.pdf'):
+            url = url + '.pdf'
+
+    log(f"PDF 다운로드 중: {url}")
+
+    try:
+        # User-Agent 설정 (일부 서버가 봇 차단)
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as response:
+            content = response.read()
+
+            # PDF 확인
+            if not content.startswith(b'%PDF'):
+                raise ValueError("다운로드된 파일이 PDF가 아닙니다")
+
+            # 임시 파일 저장
+            fd, temp_path = tempfile.mkstemp(suffix='.pdf')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(content)
+
+            log(f"다운로드 완료: {len(content) / 1024:.1f} KB")
+            return temp_path
+
+    except urllib.error.URLError as e:
+        raise ConnectionError(f"URL 접근 실패: {e}")
+    except Exception as e:
+        raise RuntimeError(f"다운로드 실패: {e}")
 
 # 지원하는 모든 파일 확장자
 SUPPORTED_EXTENSIONS = {
@@ -41,13 +109,18 @@ def translate(
     output_quality: int = 85,  # JPEG 품질 (1-100, 이미지 모드용)
     use_vector_text: bool = True,  # 벡터 텍스트 사용 (파일 크기 대폭 감소)
     compress_images: bool = True,  # 이미지 압축 사용
+    # 이중 언어 출력
+    dual_output: bool = False,  # 이중 언어 PDF 생성
+    # 정규표현식 예외 처리
+    exclude_patterns: Optional[List[str]] = None,  # 번역 제외 패턴 (정규표현식)
+    include_patterns: Optional[List[str]] = None,  # 번역 포함 패턴 (정규표현식)
     **kwargs
 ) -> TranslateResult:
     """
-    문서 번역 (PDF, Word, Excel, PowerPoint 지원)
+    문서 번역 (PDF, Word, Excel, PowerPoint, URL 지원)
 
     Args:
-        input_path: 입력 파일 경로
+        input_path: 입력 파일 경로 또는 URL (http://, https://)
         output_path: 출력 파일 경로 (None이면 자동 생성)
         source_lang: 원본 언어
         target_lang: 대상 언어
@@ -58,46 +131,88 @@ def translate(
         output_quality: JPEG 품질 1-100 (이미지 모드용, 기본 85)
         use_vector_text: 벡터 텍스트 사용 여부 (True면 파일 크기 대폭 감소)
         compress_images: 이미지 압축 사용 여부
+        dual_output: 이중 언어 PDF 생성 여부 (원문 + 번역)
+        exclude_patterns: 번역에서 제외할 정규표현식 패턴 목록
+        include_patterns: 번역에 포함할 정규표현식 패턴 목록 (지정 시 이 패턴만 번역)
         **kwargs: 번역기 추가 옵션
 
     Returns:
         TranslateResult
     """
-    # 파일 형식 확인
-    file_type = get_file_type(input_path)
-    if file_type is None:
-        return TranslateResult(
-            success=False,
-            error=f"지원하지 않는 파일 형식입니다. 지원: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
-        )
+    temp_file = None
+    actual_path = input_path
 
-    # 언어 코드 변환
-    src_code = LANGUAGES.get(source_lang, source_lang)
-    tgt_code = LANGUAGES.get(target_lang, target_lang)
+    # URL 처리: 다운로드 후 번역
+    if is_url(input_path):
+        try:
+            temp_file = download_pdf_from_url(input_path, callback)
+            actual_path = temp_file
+            # URL에서 파일명 추출하여 출력 경로 설정
+            if output_path is None:
+                # URL에서 파일명 추출
+                url_path = input_path.split('?')[0]  # 쿼리 파라미터 제거
+                filename = url_path.split('/')[-1]
+                if not filename.endswith('.pdf'):
+                    filename = 'downloaded.pdf'
+                stem = filename.rsplit('.', 1)[0]
+                output_path = f"{stem}_translated.pdf"
+        except Exception as e:
+            return TranslateResult(
+                success=False,
+                error=f"URL 다운로드 실패: {e}"
+            )
 
-    # 번역기 생성
-    translator = create_translator(
-        service=service,
-        source_lang=src_code,
-        target_lang=tgt_code,
-        **kwargs
-    )
+    try:
+        # 파일 형식 확인
+        file_type = get_file_type(actual_path)
+        if file_type is None and actual_path.endswith('.pdf'):
+            file_type = 'PDF'
+        if file_type is None:
+            return TranslateResult(
+                success=False,
+                error=f"지원하지 않는 파일 형식입니다. 지원: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
+            )
 
-    # 파일 형식에 따라 적절한 핸들러 사용
-    if file_type == 'PDF':
-        return _translate_pdf(
-            input_path, output_path, translator,
-            pages, dpi, callback,
+        # 언어 코드 변환
+        src_code = LANGUAGES.get(source_lang, source_lang)
+        tgt_code = LANGUAGES.get(target_lang, target_lang)
+
+        # 번역기 생성
+        translator = create_translator(
+            service=service,
+            source_lang=src_code,
             target_lang=tgt_code,
-            output_quality=output_quality,
-            use_vector_text=use_vector_text,
-            compress_images=compress_images,
+            **kwargs
         )
-    else:
-        return _translate_document(
-            input_path, output_path, translator,
-            file_type, callback
-        )
+
+        # 파일 형식에 따라 적절한 핸들러 사용
+        if file_type == 'PDF':
+            result = _translate_pdf(
+                actual_path, output_path, translator,
+                pages, dpi, callback,
+                target_lang=tgt_code,
+                output_quality=output_quality,
+                use_vector_text=use_vector_text,
+                compress_images=compress_images,
+                dual_output=dual_output,
+                exclude_patterns=exclude_patterns,
+                include_patterns=include_patterns,
+            )
+        else:
+            result = _translate_document(
+                actual_path, output_path, translator,
+                file_type, callback
+            )
+
+        return result
+
+    finally:
+        # 임시 파일 정리
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass
 
 
 def _translate_pdf(
@@ -111,6 +226,9 @@ def _translate_pdf(
     output_quality: int = 85,
     use_vector_text: bool = True,
     compress_images: bool = True,
+    dual_output: bool = False,
+    exclude_patterns: Optional[List[str]] = None,
+    include_patterns: Optional[List[str]] = None,
 ) -> TranslateResult:
     """PDF 번역"""
     # 출력 경로 자동 생성
@@ -127,6 +245,9 @@ def _translate_pdf(
         output_quality=output_quality,
         use_vector_text=use_vector_text,
         compress_images=compress_images,
+        dual_output=dual_output,
+        exclude_patterns=exclude_patterns,
+        include_patterns=include_patterns,
     )
 
     return converter.convert(
