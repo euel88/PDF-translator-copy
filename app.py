@@ -2,7 +2,7 @@
 PDFMathTranslate - Streamlit Application
 Based on: https://github.com/PDFMathTranslate/PDFMathTranslate
 
-A streamlined interface for translating scientific PDFs with math formula preservation.
+수학 공식을 보존하며 과학 PDF를 번역하는 인터페이스
 """
 
 import streamlit as st
@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 def init_page():
-    """Initialize Streamlit page configuration."""
+    """Streamlit 페이지 설정 초기화"""
     st.set_page_config(
-        page_title=APP_CONFIG.page_title,
-        page_icon=APP_CONFIG.page_icon,
+        page_title="PDF 수학 번역기",
+        page_icon="📚",
         layout=APP_CONFIG.layout,
         initial_sidebar_state="expanded"
     )
@@ -42,13 +42,14 @@ def init_page():
 
 
 def init_session_state():
-    """Initialize session state variables."""
+    """세션 상태 변수 초기화"""
     defaults = {
         "pdf2zh_available": False,
         "translation_in_progress": False,
         "current_file": None,
         "translation_result": None,
         "error_message": None,
+        "openai_api_key": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -56,13 +57,13 @@ def init_session_state():
 
 
 def check_pdf2zh() -> bool:
-    """Check if pdf2zh is available and initialize it."""
+    """pdf2zh 사용 가능 여부 확인 및 초기화"""
     try:
         import pdf2zh
         from pdf2zh.doclayout import ModelInstance, OnnxModel
 
         if ModelInstance.value is None:
-            with st.spinner("Loading layout detection model..."):
+            with st.spinner("레이아웃 감지 모델 로딩 중..."):
                 ModelInstance.value = OnnxModel.from_pretrained()
 
         st.session_state.pdf2zh_available = True
@@ -72,60 +73,60 @@ def check_pdf2zh() -> bool:
         st.session_state.pdf2zh_available = False
         return False
     except Exception as e:
-        logger.error(f"pdf2zh initialization failed: {e}")
+        logger.error(f"pdf2zh 초기화 실패: {e}")
         st.session_state.pdf2zh_available = False
         return False
 
 
 def render_header():
-    """Render the application header."""
+    """애플리케이션 헤더 렌더링"""
     st.markdown("""
     <div style="text-align: center; padding: 1rem 0 2rem 0;">
         <h1 style="font-size: 2.5rem; font-weight: 700; color: #1f1f1f; margin-bottom: 0.5rem;">
-            PDF Math Translator
+            PDF 수학 번역기
         </h1>
         <p style="color: #666; font-size: 1.1rem;">
-            Translate scientific PDFs while preserving mathematical formulas and layouts
+            수학 공식과 레이아웃을 보존하며 과학 PDF를 번역합니다
         </p>
     </div>
     """, unsafe_allow_html=True)
 
 
 def render_status_bar():
-    """Render the system status bar."""
+    """시스템 상태 바 렌더링"""
     col1, col2, col3 = st.columns(3)
 
     with col1:
         if st.session_state.pdf2zh_available:
-            st.success("pdf2zh: Ready")
+            st.success("pdf2zh: 준비됨")
         else:
-            st.warning("pdf2zh: Not initialized")
+            st.warning("pdf2zh: 초기화 필요")
 
     with col2:
-        if st.button("Initialize pdf2zh", use_container_width=True):
+        if st.button("pdf2zh 초기화", use_container_width=True):
             if check_pdf2zh():
-                st.success("Initialized!")
+                st.success("초기화 완료!")
                 st.rerun()
             else:
-                st.error("Failed to initialize")
+                st.error("초기화 실패")
 
     with col3:
-        st.info(f"Version: {APP_CONFIG.version}")
+        st.info(f"버전: {APP_CONFIG.version}")
 
 
 def render_file_upload() -> Optional[Any]:
-    """Render file upload section."""
-    st.markdown("### Upload PDF")
+    """파일 업로드 섹션 렌더링"""
+    st.markdown("### PDF 업로드")
 
     uploaded_file = st.file_uploader(
-        "Select a PDF file to translate",
+        "번역할 PDF 파일을 선택하세요",
         type=["pdf"],
-        help="Maximum file size: 200MB. Works best with scientific papers.",
+        help="최대 파일 크기: 200MB. 과학 논문에 최적화되어 있습니다.",
         label_visibility="collapsed"
     )
 
     if uploaded_file:
-        # File info
+        # 파일 정보
         file_size_mb = uploaded_file.size / (1024 * 1024)
 
         col1, col2 = st.columns([3, 1])
@@ -133,35 +134,35 @@ def render_file_upload() -> Optional[Any]:
             st.success(f"**{uploaded_file.name}** ({file_size_mb:.2f} MB)")
         with col2:
             if file_size_mb > 50:
-                st.warning("Large file")
+                st.warning("대용량 파일")
 
-        # Save to session state
+        # 세션 상태에 저장
         st.session_state.current_file = uploaded_file
 
     return uploaded_file
 
 
 def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Render additional translation settings in the main area."""
-    with st.expander("Advanced Settings", expanded=False):
+    """메인 영역에서 추가 번역 설정 렌더링"""
+    with st.expander("고급 설정", expanded=False):
         col1, col2 = st.columns(2)
 
         with col1:
-            # Page range
-            use_all_pages = st.checkbox("Translate all pages", value=True)
+            # 페이지 범위
+            use_all_pages = st.checkbox("모든 페이지 번역", value=True)
             if not use_all_pages:
                 settings["pages"] = st.text_input(
-                    "Page range",
-                    placeholder="e.g., 1-5, 8, 10-12",
-                    help="Specify pages to translate"
+                    "페이지 범위",
+                    placeholder="예: 1-5, 8, 10-12",
+                    help="번역할 페이지를 지정하세요"
                 )
 
         with col2:
-            # Custom prompt (for LLM-based services)
+            # 커스텀 프롬프트 (LLM 기반 서비스용)
             if settings.get("service") in ["openai", "deepseek", "gemini", "ollama"]:
                 settings["custom_prompt"] = st.text_area(
-                    "Custom prompt (optional)",
-                    placeholder="Additional instructions for translation...",
+                    "사용자 정의 프롬프트 (선택사항)",
+                    placeholder="번역을 위한 추가 지시사항...",
                     height=80
                 )
 
@@ -174,7 +175,7 @@ def translate_pdf(
     progress_placeholder
 ) -> Optional[Dict[str, Any]]:
     """
-    Execute PDF translation.
+    PDF 번역 실행
 
     Returns dict with output file paths or None on failure.
     """
@@ -182,13 +183,15 @@ def translate_pdf(
         from pdf2zh import translate
         from pdf2zh.doclayout import ModelInstance
 
-        # Prepare parameters
+        # 매개변수 준비
         envs = {}
         service = settings.get("service", "google")
 
-        # Service-specific environment variables
+        # 서비스별 환경 변수
         if service == "openai" and settings.get("openai_api_key"):
             envs["OPENAI_API_KEY"] = settings["openai_api_key"]
+            if settings.get("openai_base_url"):
+                envs["OPENAI_BASE_URL"] = settings["openai_base_url"]
         elif service == "deepl" and settings.get("deepl_api_key"):
             envs["DEEPL_API_KEY"] = settings["deepl_api_key"]
         elif service == "deepseek" and settings.get("deepseek_api_key"):
@@ -196,7 +199,7 @@ def translate_pdf(
         elif service == "gemini" and settings.get("gemini_api_key"):
             envs["GEMINI_API_KEY"] = settings["gemini_api_key"]
 
-        # Parse pages
+        # 페이지 파싱
         pages = None
         if settings.get("pages"):
             try:
@@ -208,16 +211,18 @@ def translate_pdf(
                     else:
                         pages.append(int(part) - 1)
             except ValueError:
-                logger.warning("Invalid page range, using all pages")
+                logger.warning("잘못된 페이지 범위, 전체 페이지 사용")
                 pages = None
 
-        # Create output directory
-        output_dir = tempfile.mkdtemp()
+        # 출력 디렉토리 생성
+        output_dir = settings.get("download_path", tempfile.mkdtemp())
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
 
-        # Update progress
-        progress_placeholder.info("Starting translation...")
+        # 진행 상황 업데이트
+        progress_placeholder.info("번역 시작 중...")
 
-        # Build translation parameters
+        # 번역 매개변수 구성
         translate_params = {
             "files": [file_path],
             "output": output_dir,
@@ -244,12 +249,12 @@ def translate_pdf(
                 envs["OLLAMA_HOST"] = settings["ollama_host"]
                 translate_params["envs"] = envs
 
-        # Execute translation
-        progress_placeholder.info("Translating... This may take a few minutes.")
+        # 번역 실행
+        progress_placeholder.info("번역 중... 몇 분 정도 소요될 수 있습니다.")
 
         result = translate(**translate_params)
 
-        # Get output files
+        # 출력 파일 가져오기
         base_name = Path(file_path).stem
         mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
         dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
@@ -262,73 +267,73 @@ def translate_pdf(
         }
 
     except ImportError as e:
-        logger.error(f"Import error: {e}")
-        return {"success": False, "error": "pdf2zh not available. Please initialize it first."}
+        logger.error(f"Import 오류: {e}")
+        return {"success": False, "error": "pdf2zh를 사용할 수 없습니다. 먼저 초기화해주세요."}
 
     except Exception as e:
-        logger.error(f"Translation error: {e}", exc_info=True)
+        logger.error(f"번역 오류: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
 def render_translation_button(uploaded_file, settings: Dict[str, Any]):
-    """Render translation button and handle translation."""
+    """번역 버튼 렌더링 및 번역 처리"""
 
-    # Validate settings
+    # 설정 유효성 검사
     service = settings.get("service", "google")
     can_translate = True
     warning_message = None
 
     if service == "openai" and not settings.get("openai_api_key"):
         can_translate = False
-        warning_message = "OpenAI API key required"
+        warning_message = "OpenAI API 키가 필요합니다"
     elif service == "deepl" and not settings.get("deepl_api_key"):
         can_translate = False
-        warning_message = "DeepL API key required"
+        warning_message = "DeepL API 키가 필요합니다"
     elif service == "deepseek" and not settings.get("deepseek_api_key"):
         can_translate = False
-        warning_message = "DeepSeek API key required"
+        warning_message = "DeepSeek API 키가 필요합니다"
     elif service == "gemini" and not settings.get("gemini_api_key"):
         can_translate = False
-        warning_message = "Gemini API key required"
+        warning_message = "Gemini API 키가 필요합니다"
 
     if not st.session_state.pdf2zh_available and service != "google":
         can_translate = False
-        warning_message = "Please initialize pdf2zh first"
+        warning_message = "먼저 pdf2zh를 초기화해주세요"
 
     if warning_message:
         st.warning(warning_message)
 
-    # Translation button
+    # 번역 버튼
     col1, col2, col3 = st.columns([1, 2, 1])
 
     with col2:
         translate_clicked = st.button(
-            "Translate PDF",
+            "PDF 번역하기",
             type="primary",
             disabled=not can_translate or not uploaded_file,
             use_container_width=True
         )
 
     if translate_clicked and uploaded_file:
-        # Progress placeholder
+        # 진행 상황 플레이스홀더
         progress_placeholder = st.empty()
-        progress_placeholder.info("Preparing translation...")
+        progress_placeholder.info("번역 준비 중...")
 
-        # Save uploaded file
+        # 업로드된 파일 저장
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded_file.getvalue())
             input_path = tmp.name
 
         try:
-            # Execute translation
+            # 번역 실행
             result = translate_pdf(input_path, settings, progress_placeholder)
 
             if result and result.get("success"):
-                progress_placeholder.success("Translation completed!")
+                progress_placeholder.success("번역 완료!")
                 st.balloons()
 
-                # Download buttons
-                st.markdown("### Download Results")
+                # 다운로드 버튼
+                st.markdown("### 결과 다운로드")
 
                 col1, col2 = st.columns(2)
 
@@ -339,9 +344,9 @@ def render_translation_button(uploaded_file, settings: Dict[str, Any]):
                         with col1:
                             with open(result["mono_path"], "rb") as f:
                                 st.download_button(
-                                    "Download Translation Only",
+                                    "번역본만 다운로드",
                                     f.read(),
-                                    f"{uploaded_file.name.replace('.pdf', '')}_translated.pdf",
+                                    f"{uploaded_file.name.replace('.pdf', '')}_번역본.pdf",
                                     "application/pdf",
                                     use_container_width=True
                                 )
@@ -351,118 +356,130 @@ def render_translation_button(uploaded_file, settings: Dict[str, Any]):
                         with col2:
                             with open(result["dual_path"], "rb") as f:
                                 st.download_button(
-                                    "Download Bilingual PDF",
+                                    "이중언어 PDF 다운로드",
                                     f.read(),
-                                    f"{uploaded_file.name.replace('.pdf', '')}_bilingual.pdf",
+                                    f"{uploaded_file.name.replace('.pdf', '')}_이중언어.pdf",
                                     "application/pdf",
                                     use_container_width=True
                                 )
 
+                # 저장 경로 표시
+                if settings.get("download_path"):
+                    st.info(f"파일 저장 위치: {result.get('output_dir', settings['download_path'])}")
+
             else:
-                error_msg = result.get("error", "Unknown error") if result else "Translation failed"
-                progress_placeholder.error(f"Translation failed: {error_msg}")
+                error_msg = result.get("error", "알 수 없는 오류") if result else "번역 실패"
+                progress_placeholder.error(f"번역 실패: {error_msg}")
 
         except Exception as e:
-            st.error(f"Error: {e}")
-            logger.error(f"Translation error: {e}", exc_info=True)
+            st.error(f"오류: {e}")
+            logger.error(f"번역 오류: {e}", exc_info=True)
 
         finally:
-            # Cleanup input file
+            # 입력 파일 정리
             try:
                 if os.path.exists(input_path):
                     os.unlink(input_path)
             except Exception:
                 pass
 
-            # Memory cleanup
+            # 메모리 정리
             gc.collect()
 
 
 def render_info_tab():
-    """Render the information tab."""
+    """정보 탭 렌더링"""
     st.markdown("""
-    ### About PDF Math Translator
+    ### PDF 수학 번역기 소개
 
-    This application translates scientific PDF documents while preserving:
-    - Mathematical formulas and equations
-    - Document layout and structure
-    - Tables and figures
-    - References and citations
+    이 애플리케이션은 과학 PDF 문서를 번역하면서 다음을 보존합니다:
+    - 수학 공식 및 방정식
+    - 문서 레이아웃 및 구조
+    - 표와 그림
+    - 참조 및 인용
 
-    ### Supported Services
+    ### 지원 서비스
 
-    | Service | API Key | Quality | Speed |
-    |---------|---------|---------|-------|
-    | Google Translate | Not required | Good | Fast |
-    | OpenAI GPT | Required | Excellent | Medium |
-    | DeepL | Required | Excellent | Fast |
-    | Ollama | Not required (local) | Good | Depends |
-    | DeepSeek | Required | Very Good | Medium |
-    | Gemini | Required | Very Good | Medium |
+    | 서비스 | API 키 | 품질 | 속도 |
+    |--------|--------|------|------|
+    | Google 번역 | 불필요 | 양호 | 빠름 |
+    | OpenAI GPT (ChatGPT) | 필요 | 우수 | 보통 |
+    | DeepL | 필요 | 우수 | 빠름 |
+    | Ollama | 불필요 (로컬) | 양호 | 환경에 따라 다름 |
+    | DeepSeek | 필요 | 매우 좋음 | 보통 |
+    | Gemini | 필요 | 매우 좋음 | 보통 |
 
-    ### Tips for Best Results
+    ### ChatGPT API 사용 방법
 
-    1. **Use pdf2zh**: Initialize pdf2zh for better layout preservation
-    2. **Scientific papers**: Works best with academic PDFs
-    3. **Page selection**: For large documents, translate specific pages first
-    4. **Service selection**: Google is free; OpenAI/DeepL give better quality
+    1. [OpenAI Platform](https://platform.openai.com)에서 API 키 발급
+    2. 사이드바에서 "OpenAI GPT (ChatGPT)" 선택
+    3. API 키 입력
+    4. 모델 선택 (gpt-4o-mini 권장)
+    5. PDF 업로드 후 번역 실행
 
-    ### Limitations
+    ### 최상의 결과를 위한 팁
 
-    - Maximum file size: 200MB
-    - Memory limit on cloud: ~1GB
-    - Scanned PDFs may require OCR (not available in lite version)
+    1. **pdf2zh 사용**: 더 나은 레이아웃 보존을 위해 pdf2zh 초기화
+    2. **학술 논문**: 학술 PDF에 최적화되어 있습니다
+    3. **페이지 선택**: 대용량 문서는 먼저 특정 페이지만 번역해보세요
+    4. **서비스 선택**: Google은 무료; OpenAI/DeepL은 더 좋은 품질 제공
 
-    ### Links
+    ### 제한 사항
 
-    - [PDFMathTranslate on GitHub](https://github.com/PDFMathTranslate/PDFMathTranslate)
-    - [Documentation](https://github.com/PDFMathTranslate/PDFMathTranslate/blob/main/docs/ADVANCED.md)
+    - 최대 파일 크기: 200MB
+    - 클라우드 메모리 제한: ~1GB
+    - 스캔된 PDF는 OCR이 필요할 수 있습니다
+
+    ### 링크
+
+    - [GitHub - PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate)
+    - [문서](https://github.com/PDFMathTranslate/PDFMathTranslate/blob/main/docs/ADVANCED.md)
     """)
 
 
 def main():
-    """Main application entry point."""
-    # Initialize
+    """메인 애플리케이션 진입점"""
+    # 초기화
     init_page()
     init_session_state()
 
-    # Header
+    # 헤더
     render_header()
 
-    # Status bar
+    # 상태 바
     render_status_bar()
 
     st.divider()
 
-    # Sidebar settings
+    # 사이드바 설정
     settings = render_sidebar()
 
-    # Main content tabs
-    tab_translate, tab_info = st.tabs(["Translate", "Information"])
+    # 메인 콘텐츠 탭
+    tab_translate, tab_info = st.tabs(["번역", "정보"])
 
     with tab_translate:
-        # File upload
+        # 파일 업로드
         uploaded_file = render_file_upload()
 
         if uploaded_file:
             st.divider()
 
-            # Additional settings
+            # 추가 설정
             settings = render_translation_settings(settings)
 
             st.divider()
 
-            # Translation button
+            # 번역 버튼
             render_translation_button(uploaded_file, settings)
 
     with tab_info:
         render_info_tab()
 
-    # Footer
+    # 푸터
     st.divider()
     st.caption(
         f"**{APP_CONFIG.app_name}** v{APP_CONFIG.version} | "
-        "Based on [PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate)"
+        "[PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate) 기반"
     )
 
 
