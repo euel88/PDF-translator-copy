@@ -1,15 +1,16 @@
 """
 Word 문서 핸들러 (.docx, .doc)
 python-docx 라이브러리를 사용하여 Word 문서 번역
+원본의 페이지 구성, 문장 위치, 스타일을 완벽히 보존
 """
-from typing import Optional, List
+from typing import Optional, List, Tuple, Any
 from pathlib import Path
 
 from pdf2zh.handlers.base import BaseDocumentHandler, DocumentResult
 
 
 class WordHandler(BaseDocumentHandler):
-    """Word 문서 핸들러"""
+    """Word 문서 핸들러 - 레이아웃 및 스타일 완벽 보존"""
 
     SUPPORTED_EXTENSIONS = ['.docx', '.doc']
 
@@ -19,7 +20,7 @@ class WordHandler(BaseDocumentHandler):
         output_path: Optional[str] = None
     ) -> DocumentResult:
         """
-        Word 문서 번역
+        Word 문서 번역 - 원본 레이아웃 및 스타일 보존
 
         Args:
             input_path: 입력 파일 경로
@@ -45,41 +46,31 @@ class WordHandler(BaseDocumentHandler):
             self.log(f"Word 문서 열기: {input_path}")
             doc = Document(input_path)
 
-            # 번역할 텍스트 수집
-            texts_to_translate = []
-            text_locations = []  # (type, index, sub_index, ...)
+            # Run 단위로 텍스트 수집 (스타일 완벽 보존을 위해)
+            runs_to_translate: List[Tuple[Any, str]] = []  # (run 객체, 원본 텍스트)
 
-            # 1. 단락 수집
-            for i, para in enumerate(doc.paragraphs):
-                if para.text.strip():
-                    texts_to_translate.append(para.text)
-                    text_locations.append(('paragraph', i))
+            # 1. 본문 단락의 run 수집
+            for para in doc.paragraphs:
+                self._collect_paragraph_runs(para, runs_to_translate)
 
-            # 2. 표 수집
-            for t_idx, table in enumerate(doc.tables):
-                for r_idx, row in enumerate(table.rows):
-                    for c_idx, cell in enumerate(row.cells):
-                        if cell.text.strip():
-                            texts_to_translate.append(cell.text)
-                            text_locations.append(('table', t_idx, r_idx, c_idx))
+            # 2. 표 내 모든 셀의 모든 단락 run 수집
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            self._collect_paragraph_runs(para, runs_to_translate)
 
-            # 3. 헤더/푸터 수집
+            # 3. 헤더/푸터의 run 수집
             for section in doc.sections:
-                # 헤더
                 if section.header:
-                    for i, para in enumerate(section.header.paragraphs):
-                        if para.text.strip():
-                            texts_to_translate.append(para.text)
-                            text_locations.append(('header', id(section), i))
-                # 푸터
+                    for para in section.header.paragraphs:
+                        self._collect_paragraph_runs(para, runs_to_translate)
                 if section.footer:
-                    for i, para in enumerate(section.footer.paragraphs):
-                        if para.text.strip():
-                            texts_to_translate.append(para.text)
-                            text_locations.append(('footer', id(section), i))
+                    for para in section.footer.paragraphs:
+                        self._collect_paragraph_runs(para, runs_to_translate)
 
-            total_count = len(texts_to_translate)
-            self.log(f"번역할 텍스트: {total_count}개")
+            total_count = len(runs_to_translate)
+            self.log(f"번역할 텍스트 run: {total_count}개")
 
             if total_count == 0:
                 doc.save(output_path)
@@ -89,6 +80,9 @@ class WordHandler(BaseDocumentHandler):
                     translated_count=0,
                     total_count=0
                 )
+
+            # 텍스트만 추출하여 배치 번역
+            texts_to_translate = [text for _, text in runs_to_translate]
 
             # 배치 번역 (50개씩 분할)
             self.log("번역 중...")
@@ -100,53 +94,21 @@ class WordHandler(BaseDocumentHandler):
                 self.log(f"배치 번역: {i + 1}-{min(i + len(batch), total_count)}/{total_count}")
                 batch_translated = self.translate_texts(batch)
                 translated_texts.extend(batch_translated)
-                self.log(f"진행: {min(i + batch_size, total_count)}/{total_count}")
 
-            # 번역 결과 적용
+            # 번역 결과를 각 run에 직접 적용 (스타일 완벽 보존)
             translated_count = 0
-            for idx, (location, translated) in enumerate(zip(text_locations, translated_texts)):
+            for idx, ((run, _), translated) in enumerate(zip(runs_to_translate, translated_texts)):
                 try:
-                    if location[0] == 'paragraph':
-                        para_idx = location[1]
-                        para = doc.paragraphs[para_idx]
-                        # 스타일 보존하며 텍스트 교체
-                        self._replace_paragraph_text(para, translated)
-                        translated_count += 1
-
-                    elif location[0] == 'table':
-                        t_idx, r_idx, c_idx = location[1], location[2], location[3]
-                        cell = doc.tables[t_idx].rows[r_idx].cells[c_idx]
-                        # 셀 내 첫 번째 단락만 교체
-                        if cell.paragraphs:
-                            self._replace_paragraph_text(cell.paragraphs[0], translated)
-                        translated_count += 1
-
-                    elif location[0] == 'header':
-                        section_id, para_idx = location[1], location[2]
-                        for section in doc.sections:
-                            if id(section) == section_id and section.header:
-                                self._replace_paragraph_text(
-                                    section.header.paragraphs[para_idx], translated
-                                )
-                                translated_count += 1
-                                break
-
-                    elif location[0] == 'footer':
-                        section_id, para_idx = location[1], location[2]
-                        for section in doc.sections:
-                            if id(section) == section_id and section.footer:
-                                self._replace_paragraph_text(
-                                    section.footer.paragraphs[para_idx], translated
-                                )
-                                translated_count += 1
-                                break
+                    # run.text를 직접 교체하면 스타일이 그대로 유지됨
+                    run.text = translated
+                    translated_count += 1
 
                     # 진행률 로그
-                    if (idx + 1) % 10 == 0 or idx + 1 == total_count:
-                        self.log(f"진행: {idx + 1}/{total_count}")
+                    if (idx + 1) % 50 == 0 or idx + 1 == total_count:
+                        self.log(f"적용 진행: {idx + 1}/{total_count}")
 
                 except Exception as e:
-                    self.log(f"경고: 항목 {idx} 번역 적용 실패 - {e}")
+                    self.log(f"경고: run {idx} 번역 적용 실패 - {e}")
 
             # 저장
             self.log(f"저장 중: {output_path}")
@@ -165,21 +127,24 @@ class WordHandler(BaseDocumentHandler):
                 error=str(e)
             )
 
-    def _replace_paragraph_text(self, paragraph, new_text: str):
+    def _collect_paragraph_runs(
+        self,
+        paragraph,
+        runs_list: List[Tuple[Any, str]]
+    ):
         """
-        단락 텍스트를 스타일 보존하며 교체
-        첫 번째 run의 스타일을 유지하고 나머지는 삭제
+        단락에서 번역할 run들을 수집
+
+        각 run은 고유한 스타일(굵기, 이탤릭, 글꼴, 색상 등)을 가지므로
+        run 단위로 번역해야 원본 스타일이 완벽히 보존됨
+
+        Args:
+            paragraph: 단락 객체
+            runs_list: 수집된 (run, 텍스트) 튜플 리스트
         """
-        if not paragraph.runs:
-            paragraph.text = new_text
-            return
-
-        # 첫 번째 run의 스타일 정보 저장
-        first_run = paragraph.runs[0]
-
-        # 모든 run 삭제
         for run in paragraph.runs:
-            run.clear()
-
-        # 첫 번째 run에 새 텍스트 설정
-        first_run.text = new_text
+            text = run.text
+            # 의미 있는 텍스트가 있는 run만 번역 대상
+            # 공백만 있는 run은 레이아웃 유지를 위해 그대로 보존
+            if text and text.strip():
+                runs_list.append((run, text))
