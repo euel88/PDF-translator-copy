@@ -1,5 +1,5 @@
 """Utility modules"""
-from .config import Config
-from .logger import Logger
+from utils.config import Config
+from utils.logger import Logger
 
 __all__ = ["Config", "Logger"]

@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
-from ..utils.config import Config
+from utils.config import Config
 
 
 class SettingsDialog(QDialog):

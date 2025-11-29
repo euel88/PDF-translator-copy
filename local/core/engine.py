@@ -6,10 +6,10 @@ from typing import List, Optional, Callable
 from dataclasses import dataclass
 from PIL import Image
 
-from .pdf_handler import PDFHandler, PDFInfo
-from .ocr import OCR, OCRResult
-from .translator import Translator
-from .image_processor import ImageProcessor
+from core.pdf_handler import PDFHandler, PDFInfo
+from core.ocr import OCR, OCRResult
+from core.translator import Translator
+from core.image_processor import ImageProcessor
 
 
 @dataclass

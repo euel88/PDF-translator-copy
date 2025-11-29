@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "오류", str(e))
 
     def _open_settings(self):
-        from .dialogs import SettingsDialog
+        from gui.dialogs import SettingsDialog
         dlg = SettingsDialog(self.config, self)
         if dlg.exec_():
             self._log("설정 저장됨")
