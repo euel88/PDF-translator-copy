@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Any
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import fitz  # PyMuPDF
 import numpy as np
 
@@ -367,10 +367,6 @@ class PDFConverter:
         blocks: List[TextBlock]
     ) -> Image.Image:
         """페이지 번역 및 이미지 편집"""
-        from PIL import ImageDraw, ImageFont
-        import numpy as np
-        import cv2
-
         # 번역할 블록 필터링 (수식 제외)
         to_translate = [b for b in blocks if not b.is_formula]
 
@@ -457,9 +453,6 @@ class PDFConverter:
 
     def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
         """폰트 반환"""
-        from PIL import ImageFont
-        from pathlib import Path
-
         font_paths = [
             r"C:\Windows\Fonts\malgun.ttf",
             r"C:\Windows\Fonts\meiryo.ttc",
