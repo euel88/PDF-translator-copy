@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QIcon
 
 from pdf2zh.config import config, LANGUAGES
-from pdf2zh.high_level import translate
+from pdf2zh.high_level import translate, SUPPORTED_EXTENSIONS, get_file_type
 
 
 class LogSignal(QObject):
@@ -83,7 +83,7 @@ class MainWindow(QMainWindow):
         self.load_settings()
 
     def setup_ui(self):
-        self.setWindowTitle("PDF Translator")
+        self.setWindowTitle("Document Translator (PDF, Word, Excel, PowerPoint)")
         self.setMinimumSize(800, 600)
 
         # 중앙 위젯
@@ -138,7 +138,7 @@ class MainWindow(QMainWindow):
         # 입력 파일
         input_layout = QHBoxLayout()
         self.input_path = QLineEdit()
-        self.input_path.setPlaceholderText("PDF 파일을 선택하세요")
+        self.input_path.setPlaceholderText("문서 파일을 선택하세요 (PDF, Word, Excel, PowerPoint)")
         input_btn = QPushButton("찾아보기...")
         input_btn.clicked.connect(self.browse_input)
         input_layout.addWidget(self.input_path, 1)
@@ -205,14 +205,14 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(page_to)
         page_layout.addWidget(self.page_end)
         page_layout.addStretch()
-        trans_layout.addRow("페이지:", page_layout)
+        trans_layout.addRow("페이지 (PDF):", page_layout)
 
         # DPI
         self.dpi = QSpinBox()
         self.dpi.setMinimum(72)
         self.dpi.setMaximum(600)
         self.dpi.setValue(150)
-        trans_layout.addRow("DPI:", self.dpi)
+        trans_layout.addRow("DPI (PDF):", self.dpi)
 
         layout.addWidget(trans_group)
 
@@ -322,23 +322,64 @@ class MainWindow(QMainWindow):
 
     def browse_input(self):
         """입력 파일 선택"""
+        file_filter = (
+            "All Supported Files (*.pdf *.docx *.doc *.xlsx *.xls *.pptx *.ppt);;"
+            "PDF Files (*.pdf);;"
+            "Word Files (*.docx *.doc);;"
+            "Excel Files (*.xlsx *.xls);;"
+            "PowerPoint Files (*.pptx *.ppt);;"
+            "All Files (*)"
+        )
         path, _ = QFileDialog.getOpenFileName(
-            self, "PDF 파일 선택", "", "PDF Files (*.pdf);;All Files (*)"
+            self, "문서 파일 선택", "", file_filter
         )
         if path:
             self.input_path.setText(path)
             # 자동 출력 경로 생성
             if not self.output_path.text():
                 inp = Path(path)
-                self.output_path.setText(str(inp.parent / f"{inp.stem}_translated.pdf"))
+                self.output_path.setText(str(inp.parent / f"{inp.stem}_translated{inp.suffix}"))
+            # 파일 형식에 따라 PDF 전용 옵션 활성화/비활성화
+            self._update_pdf_options(path)
 
     def browse_output(self):
         """출력 파일 선택"""
+        input_path = self.input_path.text()
+        if input_path:
+            inp = Path(input_path)
+            ext = inp.suffix.lower()
+            if ext == '.pdf':
+                file_filter = "PDF Files (*.pdf);;All Files (*)"
+            elif ext in ['.docx', '.doc']:
+                file_filter = "Word Files (*.docx *.doc);;All Files (*)"
+            elif ext in ['.xlsx', '.xls']:
+                file_filter = "Excel Files (*.xlsx *.xls);;All Files (*)"
+            elif ext in ['.pptx', '.ppt']:
+                file_filter = "PowerPoint Files (*.pptx *.ppt);;All Files (*)"
+            else:
+                file_filter = "All Files (*)"
+        else:
+            file_filter = "All Files (*)"
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "출력 파일 저장", "", "PDF Files (*.pdf);;All Files (*)"
+            self, "출력 파일 저장", "", file_filter
         )
         if path:
             self.output_path.setText(path)
+
+    def _update_pdf_options(self, file_path: str):
+        """파일 형식에 따라 PDF 전용 옵션 활성화/비활성화"""
+        file_type = get_file_type(file_path)
+        is_pdf = file_type == 'PDF'
+
+        # PDF 전용 옵션들
+        self.page_start.setEnabled(is_pdf)
+        self.page_end.setEnabled(is_pdf)
+        self.dpi.setEnabled(is_pdf)
+
+        if not is_pdf:
+            self.page_start.setValue(0)
+            self.page_end.setValue(0)
 
     def on_service_changed(self, service: str):
         """서비스 변경 시"""
