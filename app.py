@@ -3,6 +3,7 @@ PDFMathTranslate - Streamlit Application
 Based on: https://github.com/PDFMathTranslate/PDFMathTranslate
 
 수학 공식을 보존하며 과학 PDF를 번역하는 인터페이스
+이미지 내 텍스트 번역 기능 포함
 """
 
 import streamlit as st
@@ -45,6 +46,7 @@ def init_session_state():
     """세션 상태 변수 초기화"""
     defaults = {
         "pdf2zh_available": False,
+        "ocr_available": False,
         "translation_in_progress": False,
         "current_file": None,
         "translation_result": None,
@@ -78,6 +80,19 @@ def check_pdf2zh() -> bool:
         return False
 
 
+def check_ocr() -> bool:
+    """OCR 엔진 사용 가능 여부 확인"""
+    try:
+        from core.image_ocr import get_ocr_engine
+        ocr = get_ocr_engine()
+        st.session_state.ocr_available = ocr.is_available
+        return ocr.is_available
+    except Exception as e:
+        logger.error(f"OCR 초기화 실패: {e}")
+        st.session_state.ocr_available = False
+        return False
+
+
 def render_header():
     """애플리케이션 헤더 렌더링"""
     st.markdown("""
@@ -88,13 +103,16 @@ def render_header():
         <p style="color: #666; font-size: 1.1rem;">
             수학 공식과 레이아웃을 보존하며 과학 PDF를 번역합니다
         </p>
+        <p style="color: #888; font-size: 0.9rem;">
+            이미지 내 텍스트 번역 지원
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
 
 def render_status_bar():
     """시스템 상태 바 렌더링"""
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         if st.session_state.pdf2zh_available:
@@ -111,6 +129,17 @@ def render_status_bar():
                 st.error("초기화 실패")
 
     with col3:
+        # OCR 상태 확인
+        if not st.session_state.get("ocr_checked"):
+            check_ocr()
+            st.session_state.ocr_checked = True
+
+        if st.session_state.ocr_available:
+            st.success("OCR: 준비됨")
+        else:
+            st.warning("OCR: 사용 불가")
+
+    with col4:
         st.info(f"버전: {APP_CONFIG.version}")
 
 
@@ -157,6 +186,34 @@ def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     help="번역할 페이지를 지정하세요"
                 )
 
+            # 이미지 번역 옵션
+            st.markdown("---")
+            st.markdown("**이미지 번역 설정**")
+
+            settings["translate_images"] = st.checkbox(
+                "이미지 내 텍스트 번역",
+                value=True,
+                help="PDF 내 이미지에 포함된 텍스트를 OCR로 인식하여 번역합니다",
+                disabled=not st.session_state.get("ocr_available", False)
+            )
+
+            if settings.get("translate_images"):
+                settings["min_image_size"] = st.slider(
+                    "최소 이미지 크기 (픽셀)",
+                    min_value=50,
+                    max_value=500,
+                    value=100,
+                    help="이보다 작은 이미지는 건너뜁니다"
+                )
+
+                settings["ocr_confidence"] = st.slider(
+                    "OCR 신뢰도 임계값",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.5,
+                    help="이보다 낮은 신뢰도의 텍스트는 건너뜁니다"
+                )
+
         with col2:
             # 커스텀 프롬프트 (LLM 기반 서비스용)
             if settings.get("service") in ["openai", "deepseek", "gemini", "ollama"]:
@@ -166,7 +223,61 @@ def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     height=80
                 )
 
+            if settings.get("translate_images"):
+                st.markdown("---")
+                st.markdown("**이미지 편집 설정**")
+
+                settings["use_inpaint"] = st.checkbox(
+                    "인페인팅 사용",
+                    value=True,
+                    help="원본 텍스트 제거 시 주변과 자연스럽게 채웁니다"
+                )
+
     return settings
+
+
+def translate_pdf_images(
+    pdf_path: str,
+    output_path: str,
+    settings: Dict[str, Any],
+    progress_callback=None
+) -> Dict[str, Any]:
+    """PDF 내 이미지 번역"""
+    try:
+        from core.image_translator import PDFImageTranslator
+
+        # 환경 변수 구성
+        envs = {}
+        service = settings.get("service", "google")
+
+        if service == "openai" and settings.get("openai_api_key"):
+            envs["OPENAI_API_KEY"] = settings["openai_api_key"]
+        elif service == "deepl" and settings.get("deepl_api_key"):
+            envs["DEEPL_API_KEY"] = settings["deepl_api_key"]
+        elif service == "deepseek" and settings.get("deepseek_api_key"):
+            envs["DEEPSEEK_API_KEY"] = settings["deepseek_api_key"]
+        elif service == "gemini" and settings.get("gemini_api_key"):
+            envs["GEMINI_API_KEY"] = settings["gemini_api_key"]
+
+        # 이미지 번역기 생성
+        translator = PDFImageTranslator(service=service, envs=envs)
+
+        # 이미지 번역 실행
+        min_size = settings.get("min_image_size", 100)
+        result = translator.translate_pdf_images(
+            pdf_path=pdf_path,
+            output_path=output_path,
+            lang_in=settings.get("source_lang", "ko"),
+            lang_out=settings.get("target_lang", "en"),
+            min_image_size=(min_size, min_size),
+            callback=progress_callback
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"이미지 번역 실패: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def translate_pdf(
@@ -175,7 +286,7 @@ def translate_pdf(
     progress_placeholder
 ) -> Optional[Dict[str, Any]]:
     """
-    PDF 번역 실행
+    PDF 번역 실행 (텍스트 + 이미지)
 
     Returns dict with output file paths or None on failure.
     """
@@ -219,10 +330,9 @@ def translate_pdf(
         if not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
-        # 진행 상황 업데이트
-        progress_placeholder.info("번역 시작 중...")
+        # 1단계: 텍스트 번역
+        progress_placeholder.info("1단계: 텍스트 번역 중...")
 
-        # 번역 매개변수 구성
         translate_params = {
             "files": [file_path],
             "output": output_dir,
@@ -249,15 +359,49 @@ def translate_pdf(
                 envs["OLLAMA_HOST"] = settings["ollama_host"]
                 translate_params["envs"] = envs
 
-        # 번역 실행
-        progress_placeholder.info("번역 중... 몇 분 정도 소요될 수 있습니다.")
-
         result = translate(**translate_params)
 
-        # 출력 파일 가져오기
+        # 출력 파일 경로
         base_name = Path(file_path).stem
         mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
         dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
+
+        # 2단계: 이미지 번역 (옵션 활성화 시)
+        if settings.get("translate_images") and st.session_state.get("ocr_available"):
+            progress_placeholder.info("2단계: 이미지 내 텍스트 번역 중...")
+
+            # mono 파일 이미지 번역
+            if mono_file.exists():
+                mono_with_images = Path(output_dir) / f"{base_name}-mono-images.pdf"
+
+                def progress_cb(current, total):
+                    progress_placeholder.info(f"이미지 번역 중... ({current}/{total})")
+
+                img_result = translate_pdf_images(
+                    str(mono_file),
+                    str(mono_with_images),
+                    settings,
+                    progress_cb
+                )
+
+                if img_result.get("success") and mono_with_images.exists():
+                    # 원본 파일 교체
+                    os.replace(str(mono_with_images), str(mono_file))
+                    logger.info(f"이미지 번역 완료: {img_result.get('images_processed', 0)}개")
+
+            # dual 파일 이미지 번역
+            if dual_file.exists():
+                dual_with_images = Path(output_dir) / f"{base_name}-dual-images.pdf"
+
+                img_result = translate_pdf_images(
+                    str(dual_file),
+                    str(dual_with_images),
+                    settings,
+                    progress_cb
+                )
+
+                if img_result.get("success") and dual_with_images.exists():
+                    os.replace(str(dual_with_images), str(dual_file))
 
         return {
             "success": True,
@@ -302,6 +446,13 @@ def render_translation_button(uploaded_file, settings: Dict[str, Any]):
 
     if warning_message:
         st.warning(warning_message)
+
+    # 이미지 번역 정보
+    if settings.get("translate_images"):
+        if st.session_state.get("ocr_available"):
+            st.info("이미지 내 텍스트도 번역됩니다")
+        else:
+            st.warning("OCR을 사용할 수 없어 이미지 번역이 비활성화됩니다")
 
     # 번역 버튼
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -398,6 +549,14 @@ def render_info_tab():
     - 표와 그림
     - 참조 및 인용
 
+    ### 새로운 기능: 이미지 내 텍스트 번역
+
+    PDF 내의 이미지(그림, 차트, 스크린샷 등)에 포함된 텍스트도 번역합니다:
+    - **OCR 기반 텍스트 감지**: RapidOCR을 사용하여 이미지 내 텍스트 인식
+    - **자동 번역**: 감지된 텍스트를 선택한 서비스로 번역
+    - **이미지 편집**: 원본 텍스트를 지우고 번역된 텍스트로 교체
+    - **인페인팅**: 자연스러운 배경 복원
+
     ### 지원 서비스
 
     | 서비스 | API 키 | 품질 | 속도 |
@@ -423,12 +582,14 @@ def render_info_tab():
     2. **학술 논문**: 학술 PDF에 최적화되어 있습니다
     3. **페이지 선택**: 대용량 문서는 먼저 특정 페이지만 번역해보세요
     4. **서비스 선택**: Google은 무료; OpenAI/DeepL은 더 좋은 품질 제공
+    5. **이미지 번역**: 작은 이미지는 건너뛰도록 최소 크기 설정 조정
 
     ### 제한 사항
 
     - 최대 파일 크기: 200MB
     - 클라우드 메모리 제한: ~1GB
-    - 스캔된 PDF는 OCR이 필요할 수 있습니다
+    - 스캔된 PDF는 전체 페이지 OCR이 필요할 수 있습니다
+    - 복잡한 레이아웃의 이미지는 번역 품질이 저하될 수 있습니다
 
     ### 링크
 
@@ -479,7 +640,8 @@ def main():
     st.divider()
     st.caption(
         f"**{APP_CONFIG.app_name}** v{APP_CONFIG.version} | "
-        "[PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate) 기반"
+        "[PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate) 기반 | "
+        "이미지 OCR 번역 지원"
     )
 
 
