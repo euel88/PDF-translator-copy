@@ -78,7 +78,10 @@ class OpenAITranslator(BaseTranslator):
     def client(self):
         if self._client is None:
             from openai import OpenAI
-            kwargs = {"api_key": self.api_key}
+            kwargs = {
+                "api_key": self.api_key,
+                "timeout": 120.0,  # 120초 타임아웃
+            }
             if self.base_url:
                 kwargs["base_url"] = self.base_url
             self._client = OpenAI(**kwargs)
@@ -105,6 +108,7 @@ Rules:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
+            print(f"[OpenAI] 번역 오류: {e}")
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
@@ -163,8 +167,21 @@ Rules:
                             self.name, translations[idx]
                         )
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[OpenAI] 배치 번역 오류: {e}")
+            # 배치 실패 시 개별 번역으로 폴백
+            print("[OpenAI] 개별 번역으로 재시도...")
+            for orig_idx, orig_text in to_translate:
+                try:
+                    translated = self._translate(orig_text)
+                    results[orig_idx] = translated
+                    if self.use_cache:
+                        cache.set(
+                            orig_text, self.source_lang, self.target_lang,
+                            self.name, translated
+                        )
+                except Exception as e2:
+                    print(f"[OpenAI] 개별 번역 오류: {e2}")
 
         return results
 
@@ -179,7 +196,8 @@ class GoogleTranslator(BaseTranslator):
             from deep_translator import GoogleTranslator as GT
             translator = GT(source=self.source_lang, target=self.target_lang)
             return translator.translate(text)
-        except Exception:
+        except Exception as e:
+            print(f"[Google] 번역 오류: {e}")
             return text
 
 
@@ -202,7 +220,8 @@ class DeepLTranslator(BaseTranslator):
                 target_lang=self.target_lang.upper(),
             )
             return result.text
-        except Exception:
+        except Exception as e:
+            print(f"[DeepL] 번역 오류: {e}")
             return text
 
 
@@ -225,7 +244,8 @@ class OllamaTranslator(BaseTranslator):
                 messages=[{"role": "user", "content": prompt}],
             )
             return response["message"]["content"].strip()
-        except Exception:
+        except Exception as e:
+            print(f"[Ollama] 번역 오류: {e}")
             return text
 
 

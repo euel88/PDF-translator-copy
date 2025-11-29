@@ -90,9 +90,17 @@ class WordHandler(BaseDocumentHandler):
                     total_count=0
                 )
 
-            # 배치 번역
+            # 배치 번역 (50개씩 분할)
             self.log("번역 중...")
-            translated_texts = self.translate_texts(texts_to_translate)
+            batch_size = 50
+            translated_texts = []
+
+            for i in range(0, total_count, batch_size):
+                batch = texts_to_translate[i:i + batch_size]
+                self.log(f"배치 번역: {i + 1}-{min(i + len(batch), total_count)}/{total_count}")
+                batch_translated = self.translate_texts(batch)
+                translated_texts.extend(batch_translated)
+                self.log(f"진행: {min(i + batch_size, total_count)}/{total_count}")
 
             # 번역 결과 적용
             translated_count = 0
