@@ -1,13 +1,17 @@
+# PDFMathTranslate - Streamlit Configuration
+
 [theme]
-primaryColor = "#6366f1"
+primaryColor = "#4f8bf9"
 backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
-textColor = "#262730"
+secondaryBackgroundColor = "#f8faff"
+textColor = "#1f1f1f"
 font = "sans serif"
 
 [server]
 maxUploadSize = 200
 maxMessageSize = 200
+enableCORS = false
+headless = true
 
 [browser]
 gatherUsageStats = false
@@ -16,4 +20,8 @@ gatherUsageStats = false
 magicEnabled = false
 
 [client]
-showErrorDetails = false
+showErrorDetails = true
+toolbarMode = "minimal"
+
+[logger]
+level = "info"
