@@ -354,14 +354,34 @@ class PDFConverter:
                 x1 = max(s["bbox"][2] for s in line_spans)
                 y1 = max(s["bbox"][3] for s in line_spans)
 
-                first = line_spans[0]
-                font_size = first.get("size", 12)
-                font_name = first.get("font", "")
+                # 가장 많은 텍스트를 커버하는 색상 찾기 (dominant color)
+                color_weights = {}  # color -> text_length
+                for span in line_spans:
+                    color_int = span.get("color", 0)
+                    r = (color_int >> 16) & 0xFF
+                    g = (color_int >> 8) & 0xFF
+                    b = color_int & 0xFF
+                    color = (r, g, b)
+                    text_len = len(span.get("text", ""))
+                    color_weights[color] = color_weights.get(color, 0) + text_len
 
-                color_int = first.get("color", 0)
-                r = (color_int >> 16) & 0xFF
-                g = (color_int >> 8) & 0xFF
-                b = color_int & 0xFF
+                # 가장 가중치가 높은 색상 선택
+                if color_weights:
+                    dominant_color = max(color_weights.keys(), key=lambda c: color_weights[c])
+                else:
+                    dominant_color = (0, 0, 0)
+
+                # 가장 큰 폰트 크기 사용 (제목 등에서 중요)
+                font_sizes = [s.get("size", 12) for s in line_spans]
+                font_size = max(font_sizes) if font_sizes else 12
+
+                # 가장 많이 사용된 폰트 이름
+                font_names = {}
+                for span in line_spans:
+                    fn = span.get("font", "")
+                    text_len = len(span.get("text", ""))
+                    font_names[fn] = font_names.get(fn, 0) + text_len
+                font_name = max(font_names.keys(), key=lambda f: font_names[f]) if font_names else ""
 
                 is_formula = FormulaDetector.is_formula(line_text)
 
@@ -370,7 +390,7 @@ class PDFConverter:
                     bbox=(x0, y0, x1, y1),
                     font_size=font_size,
                     font_name=font_name,
-                    color=(r, g, b),
+                    color=dominant_color,
                     is_formula=is_formula,
                 ))
 
@@ -405,9 +425,11 @@ class PDFConverter:
             # 배경색 감지 (페이지 렌더링에서)
             bg_color = self._detect_bg_color_from_pixmap(page_pixmap, rect) if page_pixmap else (1, 1, 1)
 
-            # 원본 텍스트 영역을 배경색으로 덮기 (약간 확장)
-            pad = 1
-            cover_rect = fitz.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+            # 원본 텍스트 영역을 배경색으로 덮기
+            # 패딩을 최소화하여 주변 요소에 영향 줄이기
+            pad_x = 0.5  # 수평 패딩 최소화
+            pad_y = 0.5  # 수직 패딩 최소화
+            cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
             page.draw_rect(cover_rect, color=None, fill=bg_color)
 
             # 번역된 텍스트 삽입
@@ -455,31 +477,106 @@ class PDFConverter:
         pixmap: fitz.Pixmap,
         rect: fitz.Rect
     ) -> Tuple[float, float, float]:
-        """Pixmap에서 영역의 배경색 감지"""
+        """Pixmap에서 영역의 배경색 감지 - 개선된 버전"""
         try:
             # 영역 주변 샘플링
             x0, y0, x1, y1 = int(rect.x0), int(rect.y0), int(rect.x1), int(rect.y1)
 
-            # 상단 가장자리에서 샘플링
-            samples = []
-            for x in range(max(0, x0), min(pixmap.width, x1), 5):
-                if y0 > 2:
-                    # 상단 2픽셀 위에서 샘플
-                    idx = ((y0 - 2) * pixmap.width + x) * pixmap.n
-                    if idx + 2 < len(pixmap.samples):
-                        r, g, b = pixmap.samples[idx:idx+3]
-                        samples.append((r, g, b))
+            # 클램핑
+            x0 = max(0, min(x0, pixmap.width - 1))
+            x1 = max(0, min(x1, pixmap.width - 1))
+            y0 = max(0, min(y0, pixmap.height - 1))
+            y1 = max(0, min(y1, pixmap.height - 1))
 
-            if samples:
-                # 중간값 사용
-                r = sorted([s[0] for s in samples])[len(samples)//2]
-                g = sorted([s[1] for s in samples])[len(samples)//2]
-                b = sorted([s[2] for s in samples])[len(samples)//2]
-                return (r/255, g/255, b/255)
+            # 영역 내부 샘플링 (텍스트 영역 자체의 배경색 확인)
+            inner_samples = []
+            inner_step_x = max(1, (x1 - x0) // 8)
+            inner_step_y = max(1, (y1 - y0) // 4)
+
+            # 영역 내부 모서리와 가장자리에서 샘플링
+            for y in [y0 + 1, y0 + (y1 - y0) // 2, y1 - 1]:
+                for x in range(x0, x1, inner_step_x):
+                    if 0 <= x < pixmap.width and 0 <= y < pixmap.height:
+                        idx = (y * pixmap.width + x) * pixmap.n
+                        if idx + 2 < len(pixmap.samples):
+                            r, g, b = pixmap.samples[idx:idx+3]
+                            inner_samples.append((r, g, b))
+
+            # 내부 샘플에서 가장 밝은 색상 찾기 (배경일 가능성이 높음)
+            # 텍스트는 보통 어둡고 배경은 밝음
+            if inner_samples:
+                # 밝기 기준으로 정렬하여 상위 50% 선택
+                inner_samples.sort(key=lambda c: c[0] + c[1] + c[2], reverse=True)
+                bright_samples = inner_samples[:max(1, len(inner_samples) // 2)]
+
+                # 비슷한 색상 그룹핑
+                inner_groups = self._group_colors(bright_samples)
+                if inner_groups:
+                    largest_inner = max(inner_groups, key=len)
+                    inner_r = sum(c[0] for c in largest_inner) // len(largest_inner)
+                    inner_g = sum(c[1] for c in largest_inner) // len(largest_inner)
+                    inner_b = sum(c[2] for c in largest_inner) // len(largest_inner)
+
+                    # 내부 배경이 충분히 균일하면 사용
+                    if len(largest_inner) >= len(inner_samples) * 0.3:
+                        return (inner_r/255, inner_g/255, inner_b/255)
+
+            # 외부 가장자리 샘플링 (fallback)
+            edge_samples = []
+            step = max(1, (x1 - x0) // 10)
+
+            # 상단 가장자리
+            for x in range(x0, x1, step):
+                for offset in [1, 3]:
+                    if y0 > offset:
+                        idx = ((y0 - offset) * pixmap.width + x) * pixmap.n
+                        if idx + 2 < len(pixmap.samples):
+                            r, g, b = pixmap.samples[idx:idx+3]
+                            edge_samples.append((r, g, b))
+
+            # 하단 가장자리
+            for x in range(x0, x1, step):
+                for offset in [1, 3]:
+                    if y1 + offset < pixmap.height:
+                        idx = ((y1 + offset) * pixmap.width + x) * pixmap.n
+                        if idx + 2 < len(pixmap.samples):
+                            r, g, b = pixmap.samples[idx:idx+3]
+                            edge_samples.append((r, g, b))
+
+            if edge_samples:
+                edge_groups = self._group_colors(edge_samples)
+                if edge_groups:
+                    largest_edge = max(edge_groups, key=len)
+                    r = sum(c[0] for c in largest_edge) // len(largest_edge)
+                    g = sum(c[1] for c in largest_edge) // len(largest_edge)
+                    b = sum(c[2] for c in largest_edge) // len(largest_edge)
+                    return (r/255, g/255, b/255)
+
         except Exception:
             pass
 
         return (1, 1, 1)  # 기본 흰색
+
+    def _group_colors(
+        self,
+        samples: List[Tuple[int, int, int]],
+        threshold: int = 25
+    ) -> List[List[Tuple[int, int, int]]]:
+        """비슷한 색상을 그룹핑"""
+        color_groups = []
+        for sample in samples:
+            found = False
+            for group in color_groups:
+                rep = group[0]
+                if (abs(sample[0] - rep[0]) < threshold and
+                    abs(sample[1] - rep[1]) < threshold and
+                    abs(sample[2] - rep[2]) < threshold):
+                    group.append(sample)
+                    found = True
+                    break
+            if not found:
+                color_groups.append([sample])
+        return color_groups
 
     def _fit_text_vector_improved(
         self,
@@ -631,14 +728,34 @@ class PDFConverter:
                     ):
                         continue
 
-                first = line_spans[0]
-                font_size = first.get("size", 12) * scale
-                font_name = first.get("font", "")
+                # 가장 많은 텍스트를 커버하는 색상 찾기 (dominant color)
+                color_weights = {}  # color -> text_length
+                for span in line_spans:
+                    color_int = span.get("color", 0)
+                    r = (color_int >> 16) & 0xFF
+                    g = (color_int >> 8) & 0xFF
+                    b = color_int & 0xFF
+                    color = (r, g, b)
+                    text_len = len(span.get("text", ""))
+                    color_weights[color] = color_weights.get(color, 0) + text_len
 
-                color_int = first.get("color", 0)
-                r = (color_int >> 16) & 0xFF
-                g = (color_int >> 8) & 0xFF
-                b = color_int & 0xFF
+                # 가장 가중치가 높은 색상 선택
+                if color_weights:
+                    dominant_color = max(color_weights.keys(), key=lambda c: color_weights[c])
+                else:
+                    dominant_color = (0, 0, 0)
+
+                # 가장 큰 폰트 크기 사용
+                font_sizes = [s.get("size", 12) for s in line_spans]
+                font_size = (max(font_sizes) if font_sizes else 12) * scale
+
+                # 가장 많이 사용된 폰트 이름
+                font_names = {}
+                for span in line_spans:
+                    fn = span.get("font", "")
+                    text_len = len(span.get("text", ""))
+                    font_names[fn] = font_names.get(fn, 0) + text_len
+                font_name = max(font_names.keys(), key=lambda f: font_names[f]) if font_names else ""
 
                 is_formula = FormulaDetector.is_formula(line_text)
 
@@ -647,7 +764,7 @@ class PDFConverter:
                     bbox=(x0, y0, x1, y1),
                     font_size=font_size,
                     font_name=font_name,
-                    color=(r, g, b),
+                    color=dominant_color,
                     is_formula=is_formula,
                 ))
 
@@ -942,23 +1059,46 @@ class PDFConverter:
         arr: np.ndarray,
         bbox: Tuple[int, int, int, int]
     ) -> Tuple[int, int, int]:
-        """배경색 감지"""
+        """배경색 감지 - 개선된 버전"""
         x0, y0, x1, y1 = bbox
         h, w = arr.shape[:2]
 
-        samples = []
+        # 영역 내부 샘플링 우선
+        inner_samples = []
+        if x1 > x0 and y1 > y0:
+            # 영역 내부의 여러 지점에서 샘플링
+            inner_region = arr[y0:y1, x0:x1]
+            if inner_region.size > 0:
+                # 밝은 픽셀 선택 (텍스트가 아닌 배경)
+                pixels = inner_region.reshape(-1, 3)
+                brightness = np.sum(pixels, axis=1)
+                # 상위 30% 밝기의 픽셀 선택
+                threshold = np.percentile(brightness, 70)
+                bright_mask = brightness >= threshold
+                bright_pixels = pixels[bright_mask]
+
+                if len(bright_pixels) > 0:
+                    # 가장 일반적인 밝은 색상 찾기
+                    median = np.median(bright_pixels, axis=0).astype(np.uint8)
+                    return tuple(median)
+
+        # 외부 가장자리 샘플링 (fallback)
+        edge_samples = []
         pad = 3
 
         if y0 > pad:
-            samples.append(arr[y0-pad:y0, x0:x1])
+            edge_samples.append(arr[y0-pad:y0, x0:x1])
         if y1 < h - pad:
-            samples.append(arr[y1:y1+pad, x0:x1])
+            edge_samples.append(arr[y1:y1+pad, x0:x1])
+        if x0 > pad:
+            edge_samples.append(arr[y0:y1, x0-pad:x0])
+        if x1 < w - pad:
+            edge_samples.append(arr[y0:y1, x1:x1+pad])
 
-        if not samples:
+        if not edge_samples:
             return (255, 255, 255)
 
-        import numpy as np
-        all_pixels = np.concatenate([s.reshape(-1, 3) for s in samples if s.size > 0])
+        all_pixels = np.concatenate([s.reshape(-1, 3) for s in edge_samples if s.size > 0])
         if all_pixels.size == 0:
             return (255, 255, 255)
 
