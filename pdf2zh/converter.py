@@ -398,8 +398,13 @@ class PDFConverter:
             # 배경색 감지
             bg_color = self._detect_bg_color(arr, (x0, y0, x1, y1))
 
-            # 영역 지우기
-            arr[y0:y1, x0:x1] = bg_color
+            # 영역 지우기 (약간 확장)
+            pad = 2
+            y0_ext = max(0, y0 - pad)
+            y1_ext = min(arr.shape[0], y1 + pad)
+            x0_ext = max(0, x0 - pad)
+            x1_ext = min(arr.shape[1], x1 + pad)
+            arr[y0_ext:y1_ext, x0_ext:x1_ext] = bg_color
 
         img = Image.fromarray(arr)
         draw = ImageDraw.Draw(img)
@@ -407,21 +412,104 @@ class PDFConverter:
         # 텍스트 그리기
         for block, translation in zip(to_translate, translations):
             x0, y0, x1, y1 = [int(v) for v in block.bbox]
-            font = self._get_font(int(block.font_size))
+            box_width = x1 - x0
+            box_height = y1 - y0
 
-            # 폰트 크기 조정
+            # 원본 폰트 스타일에 맞는 폰트 선택
+            font = self._get_font(int(block.font_size), block.font_name)
+
+            # 텍스트 크기 측정
             text_bbox = draw.textbbox((0, 0), translation, font=font)
             text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
 
-            if text_width > (x1 - x0):
-                # 텍스트가 너무 길면 폰트 축소
-                ratio = (x1 - x0) / text_width
-                new_size = max(8, int(block.font_size * ratio * 0.9))
-                font = self._get_font(new_size)
+            # 텍스트가 영역을 초과하는 경우 처리
+            if text_width > box_width or text_height > box_height:
+                # 텍스트 줄바꿈 시도
+                wrapped_text, font = self._fit_text_in_box(
+                    draw, translation, box_width, box_height,
+                    int(block.font_size), block.font_name
+                )
+                translation = wrapped_text
 
-            draw.text((x0, y0), translation, font=font, fill=block.color)
+                # 다시 측정
+                text_bbox = draw.textbbox((0, 0), translation, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+
+            # 텍스트 위치 (수직 중앙 정렬)
+            text_x = x0
+            text_y = y0 + (box_height - text_height) // 2
+
+            # 텍스트 그리기
+            draw.text((text_x, text_y), translation, font=font, fill=block.color)
 
         return img
+
+    def _fit_text_in_box(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        box_width: int,
+        box_height: int,
+        font_size: int,
+        font_name: str
+    ) -> Tuple[str, ImageFont.FreeTypeFont]:
+        """텍스트를 박스에 맞게 조정"""
+        min_font_size = 8
+        current_size = font_size
+
+        while current_size >= min_font_size:
+            font = self._get_font(current_size, font_name)
+
+            # 줄바꿈 시도
+            wrapped = self._wrap_text(draw, text, font, box_width)
+            text_bbox = draw.textbbox((0, 0), wrapped, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            if text_width <= box_width and text_height <= box_height:
+                return wrapped, font
+
+            # 폰트 크기 축소
+            current_size = int(current_size * 0.9)
+
+        # 최소 크기로 반환
+        font = self._get_font(min_font_size, font_name)
+        wrapped = self._wrap_text(draw, text, font, box_width)
+        return wrapped, font
+
+    def _wrap_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        max_width: int
+    ) -> str:
+        """텍스트 줄바꿈"""
+        words = text.split()
+        if not words:
+            return text
+
+        lines = []
+        current_line = []
+
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            width = bbox[2] - bbox[0]
+
+            if width <= max_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        return '\n'.join(lines)
 
     def _detect_bg_color(
         self,
@@ -451,20 +539,132 @@ class PDFConverter:
         median = np.median(all_pixels, axis=0).astype(np.uint8)
         return tuple(median)
 
-    def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
-        """폰트 반환"""
-        font_paths = [
+    def _get_font(self, size: int, font_name: str = "") -> ImageFont.FreeTypeFont:
+        """
+        폰트 반환 - 원본 폰트 스타일에 맞게 선택
+
+        Args:
+            size: 폰트 크기
+            font_name: 원본 폰트 이름 (스타일 매칭용)
+        """
+        font_name_lower = font_name.lower()
+
+        # 폰트 스타일 감지
+        is_bold = "bold" in font_name_lower or "heavy" in font_name_lower
+        is_italic = "italic" in font_name_lower or "oblique" in font_name_lower
+        is_serif = any(s in font_name_lower for s in ["serif", "times", "georgia", "palatino", "batang", "myungjo"])
+        is_mono = any(s in font_name_lower for s in ["mono", "courier", "consolas", "menlo"])
+
+        # Windows 폰트 경로
+        win_fonts = {
+            # 산세리프 (기본)
+            "sans": [
+                r"C:\Windows\Fonts\malgun.ttf",      # 맑은 고딕
+                r"C:\Windows\Fonts\meiryo.ttc",     # 메이리오
+                r"C:\Windows\Fonts\msyh.ttc",       # Microsoft YaHei
+                r"C:\Windows\Fonts\segoeui.ttf",    # Segoe UI
+                r"C:\Windows\Fonts\arial.ttf",      # Arial
+            ],
+            "sans_bold": [
+                r"C:\Windows\Fonts\malgunbd.ttf",   # 맑은 고딕 Bold
+                r"C:\Windows\Fonts\meiryob.ttc",   # 메이리오 Bold
+                r"C:\Windows\Fonts\msyhbd.ttc",    # YaHei Bold
+                r"C:\Windows\Fonts\segoeuib.ttf",  # Segoe UI Bold
+                r"C:\Windows\Fonts\arialbd.ttf",   # Arial Bold
+            ],
+            # 세리프
+            "serif": [
+                r"C:\Windows\Fonts\batang.ttc",     # 바탕
+                r"C:\Windows\Fonts\times.ttf",      # Times New Roman
+                r"C:\Windows\Fonts\georgia.ttf",    # Georgia
+            ],
+            "serif_bold": [
+                r"C:\Windows\Fonts\timesbd.ttf",    # Times Bold
+                r"C:\Windows\Fonts\georgiab.ttf",   # Georgia Bold
+            ],
+            # 모노스페이스
+            "mono": [
+                r"C:\Windows\Fonts\consola.ttf",    # Consolas
+                r"C:\Windows\Fonts\cour.ttf",       # Courier New
+            ],
+        }
+
+        # macOS 폰트 경로
+        mac_fonts = {
+            "sans": [
+                "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+                "/Library/Fonts/Arial.ttf",
+            ],
+            "sans_bold": [
+                "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            ],
+            "serif": [
+                "/Library/Fonts/Times New Roman.ttf",
+            ],
+            "mono": [
+                "/System/Library/Fonts/Menlo.ttc",
+            ],
+        }
+
+        # Linux 폰트 경로
+        linux_fonts = {
+            "sans": [
+                "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            ],
+            "sans_bold": [
+                "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ],
+            "serif": [
+                "/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            ],
+            "mono": [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            ],
+        }
+
+        # 스타일에 따른 폰트 키 선택
+        if is_mono:
+            style_key = "mono"
+        elif is_serif:
+            style_key = "serif_bold" if is_bold else "serif"
+        else:
+            style_key = "sans_bold" if is_bold else "sans"
+
+        # 플랫폼별 폰트 목록
+        import sys
+        if sys.platform == "win32":
+            font_list = win_fonts.get(style_key, win_fonts["sans"])
+        elif sys.platform == "darwin":
+            font_list = mac_fonts.get(style_key, mac_fonts["sans"])
+        else:
+            font_list = linux_fonts.get(style_key, linux_fonts["sans"])
+
+        # 폰트 로드 시도
+        for font_path in font_list:
+            if Path(font_path).exists():
+                try:
+                    return ImageFont.truetype(font_path, size)
+                except Exception:
+                    continue
+
+        # 플랫폼별 기본 폰트 폴백
+        fallback_fonts = [
             r"C:\Windows\Fonts\malgun.ttf",
-            r"C:\Windows\Fonts\meiryo.ttc",
+            r"C:\Windows\Fonts\arial.ttf",
             "/System/Library/Fonts/AppleSDGothicNeo.ttc",
             "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
 
-        for p in font_paths:
-            if Path(p).exists():
+        for font_path in fallback_fonts:
+            if Path(font_path).exists():
                 try:
-                    return ImageFont.truetype(p, size)
-                except:
+                    return ImageFont.truetype(font_path, size)
+                except Exception:
                     continue
 
         return ImageFont.load_default()
