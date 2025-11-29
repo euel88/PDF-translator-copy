@@ -117,7 +117,16 @@ class ImageOCR:
                         polygon=[[int(p[0]), int(p[1])] for p in polygon]
                     ))
 
-            logger.info(f"OCR 완료: {len(regions)}개 텍스트 영역 감지 (소요시간: {elapse:.2f}s)")
+            # elapse는 리스트 또는 딕셔너리일 수 있음
+            if isinstance(elapse, (list, tuple)):
+                elapse_str = f"{sum(elapse):.2f}s" if elapse else "N/A"
+            elif isinstance(elapse, dict):
+                elapse_str = f"{sum(elapse.values()):.2f}s" if elapse else "N/A"
+            elif isinstance(elapse, (int, float)):
+                elapse_str = f"{elapse:.2f}s"
+            else:
+                elapse_str = str(elapse)
+            logger.info(f"OCR 완료: {len(regions)}개 텍스트 영역 감지 (소요시간: {elapse_str})")
 
             return OCRResult(
                 regions=regions,
