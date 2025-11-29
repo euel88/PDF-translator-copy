@@ -4,8 +4,14 @@ PDF Translator - Local Desktop Application
 로컬 PDF 번역기 메인 엔트리포인트
 """
 import sys
+import os
 import subprocess
 import platform
+
+# 현재 디렉토리를 Python 경로에 추가 (상대 import 해결)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 
 def check_and_install_dependencies():
@@ -49,11 +55,53 @@ def check_and_install_dependencies():
     return True
 
 
+def setup_tesseract_path():
+    """Windows에서 Tesseract 경로 자동 설정"""
+    if platform.system() != "Windows":
+        return True
+
+    import pytesseract
+
+    # 가능한 Tesseract 설치 경로들
+    possible_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expanduser(r"~\AppData\Local\Tesseract-OCR\tesseract.exe"),
+        r"D:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"D:\Tesseract-OCR\tesseract.exe",
+    ]
+
+    # 이미 PATH에 있는지 확인
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        pass
+
+    # 가능한 경로에서 찾기
+    for path in possible_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            try:
+                pytesseract.get_tesseract_version()
+                print(f"Tesseract 발견: {path}")
+                return True
+            except Exception:
+                continue
+
+    return False
+
+
 def check_tesseract():
     """Tesseract OCR 설치 확인"""
     try:
+        # Windows 경로 자동 설정
+        if not setup_tesseract_path():
+            return False
+
         import pytesseract
-        pytesseract.get_tesseract_version()
+        version = pytesseract.get_tesseract_version()
+        print(f"Tesseract 버전: {version}")
         return True
     except Exception:
         return False
@@ -78,18 +126,14 @@ Windows 설치 방법:
    - Japanese (일본어)
    - Chinese (중국어) 등
 
-3. 설치 후 PATH에 추가하거나 기본 경로 사용:
-   C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+3. 기본 설치 경로 권장:
+   C:\\Program Files\\Tesseract-OCR\\
 """)
     elif system == "Darwin":  # macOS
         print("""
 macOS 설치 방법:
   brew install tesseract
   brew install tesseract-lang  # 추가 언어
-
-또는:
-  sudo port install tesseract
-  sudo port install tesseract-<lang>
 """)
     else:  # Linux
         print("""
@@ -98,7 +142,6 @@ Linux 설치 방법:
   sudo apt install tesseract-ocr
   sudo apt install tesseract-ocr-kor  # 한국어
   sudo apt install tesseract-ocr-jpn  # 일본어
-  sudo apt install tesseract-ocr-chi-sim  # 중국어 간체
 """)
 
     print("=" * 50)
@@ -119,7 +162,6 @@ def main():
     # Tesseract 확인
     if not check_tesseract():
         show_tesseract_guide()
-        # 경고만 표시하고 계속 진행 (GUI에서 설정 가능)
         print("\n경고: Tesseract 없이 계속 진행합니다.")
         print("OCR 기능은 Tesseract 설치 후 사용 가능합니다.\n")
 
