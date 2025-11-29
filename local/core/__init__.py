@@ -1,16 +1,14 @@
-"""
-Core modules for PDF translation
-"""
-from .ocr_engine import OCREngine, TextRegion, OCRResult
-from .translator import OpenAITranslator
-from .pdf_processor import PDFProcessor
-from .image_editor import ImageEditor
+"""Core modules for PDF translation"""
+from .pdf_handler import PDFHandler
+from .ocr import OCR
+from .translator import Translator
+from .image_processor import ImageProcessor
+from .engine import TranslationEngine
 
 __all__ = [
-    "OCREngine",
-    "TextRegion",
-    "OCRResult",
-    "OpenAITranslator",
-    "PDFProcessor",
-    "ImageEditor",
+    "PDFHandler",
+    "OCR",
+    "Translator",
+    "ImageProcessor",
+    "TranslationEngine",
 ]
