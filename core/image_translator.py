@@ -108,10 +108,21 @@ class ImageTranslator:
                     model="google"
                 )
 
-            return translator.translate(text)
+            result = translator.translate(text)
+
+            # 디버깅: 번역 결과 로깅 (처음 5개만)
+            if not hasattr(self, '_translation_log_count'):
+                self._translation_log_count = 0
+            if self._translation_log_count < 5:
+                logger.info(f"번역 샘플 [{lang_in}->{lang_out}]: '{text[:50]}...' -> '{result[:50] if result else '(empty)'}...'")
+                self._translation_log_count += 1
+
+            return result
 
         except Exception as e:
-            logger.error(f"번역 실패: {e}")
+            logger.error(f"번역 실패 ({self.service}): {e}")
+            import traceback
+            traceback.print_exc()
             return text
 
     def translate_image(
@@ -161,11 +172,24 @@ class ImageTranslator:
             translations = []
             replacements = []
 
+            # 통계 추적
+            stats = {
+                "low_confidence": 0,
+                "too_short": 0,
+                "invalid_bbox": 0,
+                "too_small": 0,
+                "no_translation_needed": 0,
+                "translation_failed": 0,
+                "translated": 0
+            }
+
             for region in ocr_result.regions:
                 # 신뢰도 및 길이 필터링
                 if region.confidence < min_confidence:
+                    stats["low_confidence"] += 1
                     continue
                 if len(region.text.strip()) < min_text_length:
+                    stats["too_short"] += 1
                     continue
 
                 # bbox 유효성 검사
@@ -179,12 +203,14 @@ class ImageTranslator:
 
                 if x2 <= x1 or y2 <= y1:
                     logger.debug(f"잘못된 bbox 건너뜀: {region.bbox}")
+                    stats["invalid_bbox"] += 1
                     continue
 
                 # 너무 작은 영역 건너뛰기
                 box_width = x2 - x1
                 box_height = y2 - y1
                 if box_width < 10 or box_height < 10:
+                    stats["too_small"] += 1
                     continue
 
                 # polygon도 클리핑
@@ -194,14 +220,31 @@ class ImageTranslator:
                     py = max(0, min(pt[1], img_height))
                     valid_polygon.append([int(px), int(py)])
 
-                # 번역
                 original_text = region.text.strip()
-                translated_text = self.translator_func(original_text, lang_in, lang_out)
 
-                # 번역이 실패하거나 빈 경우 건너뛰기
-                if not translated_text or translated_text == original_text:
+                # 번역이 필요 없는 텍스트 판별 (숫자만, 특수문자만)
+                import re
+                # 숫자, 공백, 기본 구두점만 있는 경우 건너뛰기
+                if re.match(r'^[\d\s\.\,\-\+\=\%\$\€\£\¥\(\)\[\]\{\}\/\\\*\#\@\!\?\:\;\'\"\`\~\^\&\|\<\>]+$', original_text):
+                    stats["no_translation_needed"] += 1
                     continue
 
+                # 번역
+                translated_text = self.translator_func(original_text, lang_in, lang_out)
+
+                # 번역 결과 확인
+                if not translated_text:
+                    stats["translation_failed"] += 1
+                    logger.debug(f"번역 실패 (빈 결과): '{original_text[:30]}...'")
+                    continue
+
+                # 번역 결과가 원본과 동일해도 처리 (이미 대상 언어일 수 있음)
+                # 단, 로그에 기록
+                if translated_text == original_text:
+                    logger.debug(f"번역 결과 동일: '{original_text[:30]}...'")
+                    # 여전히 처리는 진행 (텍스트 위치/크기 조정 등)
+
+                stats["translated"] += 1
                 translations.append({
                     "original": original_text,
                     "translated": translated_text
@@ -213,6 +256,11 @@ class ImageTranslator:
                     bbox=(int(x1), int(y1), int(x2), int(y2)),
                     polygon=valid_polygon
                 ))
+
+            # 통계 로깅
+            logger.info(f"텍스트 필터링 통계: 번역됨={stats['translated']}, "
+                       f"신뢰도낮음={stats['low_confidence']}, 너무짧음={stats['too_short']}, "
+                       f"번역불필요={stats['no_translation_needed']}, 번역실패={stats['translation_failed']}")
 
             # 3. 이미지 편집
             logger.info(f"{len(replacements)}개 텍스트 교체 중...")
@@ -498,9 +546,6 @@ class PDFImageTranslator:
                         if not translation_result.success:
                             result["errors"].append(f"Page {page_num + 1}: {translation_result.error_message}")
 
-                    # BGR to RGB for PDF
-                    processed_img_rgb = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
-
                     # 이미지를 PDF 페이지로 변환
                     # 원본 페이지 크기 유지
                     page_width = page.rect.width
@@ -509,14 +554,26 @@ class PDFImageTranslator:
                     # 새 페이지 생성
                     new_page = new_doc.new_page(width=page_width, height=page_height)
 
-                    # 이미지를 PNG로 인코딩
-                    success, encoded = cv2.imencode(".png", processed_img_rgb)
-                    if success:
-                        # 이미지 삽입
-                        new_page.insert_image(
-                            new_page.rect,
-                            stream=encoded.tobytes()
-                        )
+                    # PIL을 사용하여 PNG로 정확하게 인코딩
+                    # (cv2.imencode는 BGR을 기대하지만 색상 채널 처리가 불일치할 수 있음)
+                    from PIL import Image
+                    import io
+
+                    # BGR to RGB 변환 후 PIL Image 생성
+                    processed_img_rgb = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(processed_img_rgb)
+
+                    # PNG 바이트로 변환
+                    buffer = io.BytesIO()
+                    pil_img.save(buffer, format="PNG", optimize=False)
+                    png_bytes = buffer.getvalue()
+
+                    # 이미지 삽입
+                    new_page.insert_image(
+                        new_page.rect,
+                        stream=png_bytes
+                    )
+                    logger.debug(f"페이지 {page_num + 1} 이미지 삽입 완료 (크기: {len(png_bytes)} bytes)")
 
                     result["pages_processed"] += 1
 

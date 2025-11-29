@@ -107,16 +107,21 @@ class ImageTextEditor:
             try:
                 if Path(font_path).exists():
                     self._cached_font_path = font_path
-                    logger.debug(f"폰트 로드: {font_path}")
+                    # 처음 로드 시에만 로깅
+                    if not hasattr(self, '_font_logged'):
+                        logger.info(f"폰트 로드 성공: {font_path}")
+                        self._font_logged = True
                     return ImageFont.truetype(font_path, size)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"폰트 로드 실패 ({font_path}): {e}")
                 continue
 
         # 기본 폰트 사용
-        logger.warning("적절한 폰트를 찾을 수 없어 기본 폰트 사용")
+        logger.warning("적절한 폰트를 찾을 수 없어 기본 폰트 사용 (한글 지원 불가)")
         try:
             return ImageFont.load_default()
         except Exception:
+            logger.error("기본 폰트도 로드 실패")
             return None
 
     def _estimate_font_size(
@@ -492,6 +497,7 @@ class ImageTextEditor:
         draw = ImageDraw.Draw(pil_image)
 
         # 번역된 텍스트 삽입
+        text_drawn_count = 0
         for replacement in replacements:
             try:
                 x1, y1, x2, y2 = replacement.bbox
@@ -499,10 +505,12 @@ class ImageTextEditor:
                 box_height = y2 - y1
 
                 if box_width <= 0 or box_height <= 0:
+                    logger.debug(f"박스 크기 무효: {box_width}x{box_height}")
                     continue
 
                 translated_text = replacement.translated_text.strip()
                 if not translated_text:
+                    logger.debug("번역 텍스트 비어있음")
                     continue
 
                 # 폰트 크기 결정 (개선된 알고리즘 사용)
@@ -515,6 +523,8 @@ class ImageTextEditor:
                     )
 
                 font = self._get_font(font_size, lang)
+                if font is None:
+                    logger.warning(f"폰트 로드 실패 (크기: {font_size})")
 
                 # 텍스트 색상 결정
                 text_color = replacement.font_color
@@ -563,9 +573,13 @@ class ImageTextEditor:
                     # 텍스트 그리기
                     draw.text((x, y), line, fill=text_color, font=font)
 
+                text_drawn_count += 1
+
             except Exception as e:
                 logger.error(f"텍스트 교체 실패 '{replacement.translated_text[:20]}...': {e}")
                 continue
+
+        logger.info(f"텍스트 렌더링 완료: {text_drawn_count}/{len(replacements)}개 텍스트 그려짐")
 
         # RGB to BGR
         result = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
