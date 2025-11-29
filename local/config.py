@@ -90,17 +90,20 @@ LANGUAGES = {
     "Arabic": "ar",
 }
 
-# OCR 언어 코드 (PaddleOCR)
+# OCR 언어 코드 (Tesseract)
 OCR_LANGUAGES = {
-    "English": "en",
-    "Korean": "korean",
-    "Japanese": "japan",
-    "Chinese": "ch",
-    "French": "french",
-    "German": "german",
-    "Russian": "ru",
-    "Spanish": "es",
-    "Portuguese": "pt",
-    "Italian": "it",
-    "Arabic": "ar",
+    "English": "eng",
+    "Korean": "kor",
+    "Japanese": "jpn",
+    "Chinese (Simplified)": "chi_sim",
+    "Chinese (Traditional)": "chi_tra",
+    "French": "fra",
+    "German": "deu",
+    "Russian": "rus",
+    "Spanish": "spa",
+    "Portuguese": "por",
+    "Italian": "ita",
+    "Vietnamese": "vie",
+    "Thai": "tha",
+    "Arabic": "ara",
 }

@@ -6,9 +6,8 @@ PyQt5>=5.15.0
 # PDF Processing
 PyMuPDF>=1.23.0
 
-# OCR
-paddlepaddle>=2.5.0
-paddleocr>=2.7.0
+# OCR (Python wrapper - Tesseract 엔진은 별도 설치 필요)
+pytesseract>=0.3.10
 
 # Image Processing
 Pillow>=10.0.0
@@ -17,6 +16,3 @@ numpy>=1.24.0
 
 # Translation
 openai>=1.0.0
-
-# Utilities
-python-dotenv>=1.0.0
