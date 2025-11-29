@@ -3,6 +3,8 @@ Image Translator Module
 이미지 내 텍스트를 번역하는 통합 모듈
 
 OCR -> 번역 -> 이미지 편집 파이프라인
+
+변경: 페이지 렌더링 방식으로 전환 (XObject 추출 대신)
 """
 
 import logging
@@ -10,6 +12,8 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass
 import numpy as np
 from pathlib import Path
+import tempfile
+import os
 
 from core.image_ocr import ImageOCR, OCRResult, TextRegion, get_ocr_engine, ocr_image
 from core.image_editor import ImageTextEditor, TextReplacement, replace_image_text
@@ -251,7 +255,7 @@ class ImageTranslator:
 
 
 class PDFImageTranslator:
-    """PDF 내 이미지 번역 클래스"""
+    """PDF 내 이미지/그림 번역 클래스 (페이지 렌더링 방식)"""
 
     def __init__(
         self,
@@ -262,13 +266,48 @@ class PDFImageTranslator:
         self.envs = envs or {}
         self.image_translator = ImageTranslator(service=service, envs=envs)
 
+    def render_page_to_image(
+        self,
+        page,
+        dpi: int = 150
+    ) -> np.ndarray:
+        """
+        PDF 페이지를 이미지로 렌더링
+
+        Args:
+            page: PyMuPDF page 객체
+            dpi: 렌더링 해상도
+
+        Returns:
+            numpy 배열 이미지 (BGR)
+        """
+        import cv2
+
+        # 줌 계수 계산 (기본 72 DPI 기준)
+        zoom = dpi / 72
+        mat = page.get_pixmap(matrix=page.parent.identity_matrix * zoom).samples
+
+        # pixmap 가져오기
+        pix = page.get_pixmap(matrix=page.parent.identity_matrix * zoom)
+
+        # numpy 배열로 변환
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
+        # RGB to BGR (OpenCV 형식)
+        if pix.n == 4:  # RGBA
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif pix.n == 3:  # RGB
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        return img
+
     def extract_images_from_pdf(
         self,
         pdf_path: str,
         min_size: Tuple[int, int] = (100, 100)
     ) -> List[Dict[str, Any]]:
         """
-        PDF에서 이미지 추출
+        PDF에서 이미지 추출 (XObject 방식 - 백업용)
 
         Args:
             pdf_path: PDF 파일 경로
@@ -330,8 +369,144 @@ class PDFImageTranslator:
                     continue
 
         doc.close()
-        logger.info(f"PDF에서 {len(images)}개 이미지 추출")
+        logger.info(f"PDF에서 {len(images)}개 XObject 이미지 추출")
         return images
+
+    def translate_pdf_pages(
+        self,
+        pdf_path: str,
+        output_path: str,
+        lang_in: str = "ko",
+        lang_out: str = "en",
+        dpi: int = 150,
+        callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        PDF 페이지를 이미지로 렌더링하여 번역 (새로운 방식)
+
+        이 방식은 페이지 전체를 이미지로 렌더링하여 OCR을 수행하므로
+        XObject로 저장되지 않은 이미지/그래픽도 처리 가능
+
+        Args:
+            pdf_path: 입력 PDF 경로
+            output_path: 출력 PDF 경로
+            lang_in: 원본 언어
+            lang_out: 대상 언어
+            dpi: 렌더링 해상도
+            callback: 진행 콜백 (current, total, message)
+
+        Returns:
+            처리 결과: {"success": bool, "pages_processed": int, "translations_count": int, "errors": list}
+        """
+        import fitz  # PyMuPDF
+        import cv2
+
+        result = {
+            "success": False,
+            "pages_processed": 0,
+            "pages_total": 0,
+            "translations_count": 0,
+            "errors": []
+        }
+
+        try:
+            # 원본 PDF 열기
+            doc = fitz.open(pdf_path)
+            result["pages_total"] = len(doc)
+
+            # 새 PDF 생성
+            new_doc = fitz.open()
+
+            for page_num in range(len(doc)):
+                try:
+                    if callback:
+                        callback(page_num + 1, len(doc), f"페이지 {page_num + 1} 처리 중...")
+
+                    page = doc[page_num]
+
+                    # 페이지를 이미지로 렌더링
+                    logger.info(f"페이지 {page_num + 1} 렌더링 중...")
+                    zoom = dpi / 72
+                    mat = fitz.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=mat)
+
+                    # numpy 배열로 변환
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
+                    # RGB to BGR (OpenCV 형식)
+                    if pix.n == 4:  # RGBA
+                        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                    elif pix.n == 3:  # RGB
+                        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                    # OCR 및 번역
+                    logger.info(f"페이지 {page_num + 1} OCR 수행 중...")
+                    translation_result = self.image_translator.translate_image(
+                        img,
+                        lang_in=lang_in,
+                        lang_out=lang_out,
+                        min_confidence=0.5,
+                        min_text_length=2,
+                        use_inpaint=True
+                    )
+
+                    if translation_result.success and translation_result.translations:
+                        # 번역된 이미지 사용
+                        processed_img = translation_result.translated_image
+                        result["translations_count"] += len(translation_result.translations)
+                        logger.info(f"페이지 {page_num + 1}: {len(translation_result.translations)}개 텍스트 번역됨")
+                    else:
+                        # 원본 이미지 사용
+                        processed_img = img
+                        if not translation_result.success:
+                            result["errors"].append(f"Page {page_num + 1}: {translation_result.error_message}")
+
+                    # BGR to RGB for PDF
+                    processed_img_rgb = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
+
+                    # 이미지를 PDF 페이지로 변환
+                    # 원본 페이지 크기 유지
+                    page_width = page.rect.width
+                    page_height = page.rect.height
+
+                    # 새 페이지 생성
+                    new_page = new_doc.new_page(width=page_width, height=page_height)
+
+                    # 이미지를 PNG로 인코딩
+                    success, encoded = cv2.imencode(".png", processed_img_rgb)
+                    if success:
+                        # 이미지 삽입
+                        new_page.insert_image(
+                            new_page.rect,
+                            stream=encoded.tobytes()
+                        )
+
+                    result["pages_processed"] += 1
+
+                except Exception as e:
+                    logger.error(f"페이지 {page_num + 1} 처리 실패: {e}")
+                    result["errors"].append(f"Page {page_num + 1}: {str(e)}")
+
+                    # 오류 시 원본 페이지 복사
+                    try:
+                        new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                    except:
+                        pass
+
+            # PDF 저장
+            new_doc.save(output_path)
+            new_doc.close()
+            doc.close()
+
+            result["success"] = True
+            logger.info(f"PDF 페이지 번역 완료: {result['pages_processed']}/{result['pages_total']} 페이지, "
+                       f"{result['translations_count']}개 텍스트 번역됨")
+
+        except Exception as e:
+            logger.error(f"PDF 페이지 번역 실패: {e}")
+            result["errors"].append(str(e))
+
+        return result
 
     def translate_pdf_images(
         self,
@@ -340,7 +515,8 @@ class PDFImageTranslator:
         lang_in: str = "ko",
         lang_out: str = "en",
         min_image_size: Tuple[int, int] = (100, 100),
-        callback: Optional[Callable[[int, int], None]] = None
+        callback: Optional[Callable[[int, int], None]] = None,
+        use_page_render: bool = True
     ) -> Dict[str, Any]:
         """
         PDF 내 이미지 번역 및 교체
@@ -352,10 +528,23 @@ class PDFImageTranslator:
             lang_out: 대상 언어
             min_image_size: 최소 이미지 크기
             callback: 진행 콜백 (current, total)
+            use_page_render: 페이지 렌더링 방식 사용 여부
 
         Returns:
             처리 결과: {"success": bool, "images_processed": int, "errors": list}
         """
+        # 페이지 렌더링 방식 사용 (권장)
+        if use_page_render:
+            def progress_callback(current, total, msg):
+                if callback:
+                    callback(current, total)
+
+            return self.translate_pdf_pages(
+                pdf_path, output_path, lang_in, lang_out,
+                dpi=150, callback=progress_callback
+            )
+
+        # 기존 XObject 추출 방식 (백업)
         import fitz  # PyMuPDF
         import cv2
 

@@ -188,22 +188,24 @@ def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
 
             # 이미지 번역 옵션
             st.markdown("---")
-            st.markdown("**이미지 번역 설정**")
+            st.markdown("**이미지/그림 번역 설정**")
 
             settings["translate_images"] = st.checkbox(
-                "이미지 내 텍스트 번역",
+                "그림/차트 내 텍스트 번역 (OCR)",
                 value=True,
-                help="PDF 내 이미지에 포함된 텍스트를 OCR로 인식하여 번역합니다",
+                help="PDF 내 그림, 차트, 이미지에 포함된 텍스트를 OCR로 인식하여 번역합니다. 페이지를 이미지로 렌더링하여 처리합니다.",
                 disabled=not st.session_state.get("ocr_available", False)
             )
 
             if settings.get("translate_images"):
-                settings["min_image_size"] = st.slider(
-                    "최소 이미지 크기 (픽셀)",
-                    min_value=50,
-                    max_value=500,
-                    value=100,
-                    help="이보다 작은 이미지는 건너뜁니다"
+                settings["image_translation_mode"] = st.radio(
+                    "번역 모드",
+                    options=["text_and_images", "images_only"],
+                    format_func=lambda x: {
+                        "text_and_images": "텍스트 + 그림 (권장)",
+                        "images_only": "그림/이미지만 (OCR 전체)"
+                    }.get(x, x),
+                    help="'텍스트 + 그림': pdf2zh로 텍스트 번역 후 이미지 처리\n'그림/이미지만': 페이지 전체를 OCR로 번역 (이미지 PDF 생성)"
                 )
 
                 settings["ocr_confidence"] = st.slider(
@@ -212,6 +214,14 @@ def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     max_value=1.0,
                     value=0.5,
                     help="이보다 낮은 신뢰도의 텍스트는 건너뜁니다"
+                )
+
+                settings["render_dpi"] = st.slider(
+                    "렌더링 해상도 (DPI)",
+                    min_value=72,
+                    max_value=300,
+                    value=150,
+                    help="높을수록 품질이 좋지만 처리 시간이 증가합니다"
                 )
 
         with col2:
@@ -233,6 +243,11 @@ def render_translation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     help="원본 텍스트 제거 시 주변과 자연스럽게 채웁니다"
                 )
 
+                st.info("""
+                **참고**: 그림/차트 번역은 페이지를 이미지로 렌더링하여
+                OCR을 수행합니다. 결과물은 이미지 기반 PDF가 됩니다.
+                """)
+
     return settings
 
 
@@ -242,7 +257,7 @@ def translate_pdf_images(
     settings: Dict[str, Any],
     progress_callback=None
 ) -> Dict[str, Any]:
-    """PDF 내 이미지 번역"""
+    """PDF 내 이미지/그림 번역 (페이지 렌더링 방식)"""
     try:
         from core.image_translator import PDFImageTranslator
 
@@ -262,21 +277,29 @@ def translate_pdf_images(
         # 이미지 번역기 생성
         translator = PDFImageTranslator(service=service, envs=envs)
 
-        # 이미지 번역 실행
-        min_size = settings.get("min_image_size", 100)
-        result = translator.translate_pdf_images(
+        # 렌더링 DPI 설정
+        dpi = settings.get("render_dpi", 150)
+
+        # 페이지 렌더링 방식으로 번역 (이미지/그림 내 텍스트 포함)
+        def page_progress_callback(current, total, msg):
+            if progress_callback:
+                progress_callback(current, total)
+
+        result = translator.translate_pdf_pages(
             pdf_path=pdf_path,
             output_path=output_path,
             lang_in=settings.get("source_lang", "ko"),
             lang_out=settings.get("target_lang", "en"),
-            min_image_size=(min_size, min_size),
-            callback=progress_callback
+            dpi=dpi,
+            callback=page_progress_callback
         )
 
         return result
 
     except Exception as e:
         logger.error(f"이미지 번역 실패: {e}")
+        import traceback
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
@@ -290,6 +313,49 @@ def translate_pdf(
 
     Returns dict with output file paths or None on failure.
     """
+    # 출력 디렉토리 생성
+    output_dir = settings.get("download_path", tempfile.mkdtemp())
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    base_name = Path(file_path).stem
+
+    # 이미지 전용 모드: OCR로 전체 페이지 번역
+    if (settings.get("translate_images") and
+        settings.get("image_translation_mode") == "images_only" and
+        st.session_state.get("ocr_available")):
+
+        progress_placeholder.info("페이지 전체 OCR 번역 중... (이미지 PDF 생성)")
+
+        ocr_output = Path(output_dir) / f"{base_name}-ocr.pdf"
+
+        def progress_cb(current, total):
+            progress_placeholder.info(f"페이지 OCR 번역 중... ({current}/{total})")
+
+        img_result = translate_pdf_images(
+            file_path,
+            str(ocr_output),
+            settings,
+            progress_cb
+        )
+
+        if img_result.get("success") and ocr_output.exists():
+            progress_placeholder.success(
+                f"번역 완료! {img_result.get('translations_count', 0)}개 텍스트 번역됨"
+            )
+            return {
+                "success": True,
+                "mono_path": str(ocr_output),
+                "dual_path": None,
+                "output_dir": output_dir,
+            }
+        else:
+            return {
+                "success": False,
+                "error": img_result.get("error", "OCR 번역 실패")
+            }
+
+    # 일반 모드: pdf2zh 텍스트 번역 + 선택적 이미지 번역
     try:
         from pdf2zh import translate
         from pdf2zh.doclayout import ModelInstance
@@ -325,11 +391,6 @@ def translate_pdf(
                 logger.warning("잘못된 페이지 범위, 전체 페이지 사용")
                 pages = None
 
-        # 출력 디렉토리 생성
-        output_dir = settings.get("download_path", tempfile.mkdtemp())
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-
         # 1단계: 텍스트 번역
         progress_placeholder.info("1단계: 텍스트 번역 중...")
 
@@ -362,46 +423,40 @@ def translate_pdf(
         result = translate(**translate_params)
 
         # 출력 파일 경로
-        base_name = Path(file_path).stem
         mono_file = Path(output_dir) / f"{base_name}-mono.pdf"
         dual_file = Path(output_dir) / f"{base_name}-dual.pdf"
 
-        # 2단계: 이미지 번역 (옵션 활성화 시)
-        if settings.get("translate_images") and st.session_state.get("ocr_available"):
-            progress_placeholder.info("2단계: 이미지 내 텍스트 번역 중...")
+        # 2단계: 이미지/그림 번역 (옵션 활성화 시)
+        if (settings.get("translate_images") and
+            settings.get("image_translation_mode") == "text_and_images" and
+            st.session_state.get("ocr_available")):
 
-            # mono 파일 이미지 번역
-            if mono_file.exists():
-                mono_with_images = Path(output_dir) / f"{base_name}-mono-images.pdf"
+            progress_placeholder.info("2단계: 그림/차트 내 텍스트 OCR 번역 중...")
 
-                def progress_cb(current, total):
-                    progress_placeholder.info(f"이미지 번역 중... ({current}/{total})")
+            # 원본 PDF에서 이미지 번역하여 별도 파일 생성
+            # (pdf2zh 출력이 아닌 원본 사용 - 그림 내 텍스트가 원본에 있음)
+            ocr_output = Path(output_dir) / f"{base_name}-ocr.pdf"
 
-                img_result = translate_pdf_images(
-                    str(mono_file),
-                    str(mono_with_images),
-                    settings,
-                    progress_cb
-                )
+            def progress_cb(current, total):
+                progress_placeholder.info(f"그림 OCR 번역 중... ({current}/{total})")
 
-                if img_result.get("success") and mono_with_images.exists():
-                    # 원본 파일 교체
-                    os.replace(str(mono_with_images), str(mono_file))
-                    logger.info(f"이미지 번역 완료: {img_result.get('images_processed', 0)}개")
+            img_result = translate_pdf_images(
+                file_path,  # 원본 PDF 사용
+                str(ocr_output),
+                settings,
+                progress_cb
+            )
 
-            # dual 파일 이미지 번역
-            if dual_file.exists():
-                dual_with_images = Path(output_dir) / f"{base_name}-dual-images.pdf"
-
-                img_result = translate_pdf_images(
-                    str(dual_file),
-                    str(dual_with_images),
-                    settings,
-                    progress_cb
-                )
-
-                if img_result.get("success") and dual_with_images.exists():
-                    os.replace(str(dual_with_images), str(dual_file))
+            if img_result.get("success") and ocr_output.exists():
+                logger.info(f"이미지 번역 완료: {img_result.get('translations_count', 0)}개")
+                # OCR 번역 파일을 추가로 제공
+                return {
+                    "success": True,
+                    "mono_path": str(mono_file) if mono_file.exists() else None,
+                    "dual_path": str(dual_file) if dual_file.exists() else None,
+                    "ocr_path": str(ocr_output),  # OCR 번역본 추가
+                    "output_dir": output_dir,
+                }
 
         return {
             "success": True,
@@ -486,33 +541,44 @@ def render_translation_button(uploaded_file, settings: Dict[str, Any]):
                 # 다운로드 버튼
                 st.markdown("### 결과 다운로드")
 
-                col1, col2 = st.columns(2)
-
                 output_format = settings.get("output_format", "dual")
+
+                # 사용 가능한 다운로드 파일 수에 따라 컬럼 조정
+                download_files = []
 
                 if output_format in ["mono", "both"] and result.get("mono_path"):
                     if os.path.exists(result["mono_path"]):
-                        with col1:
-                            with open(result["mono_path"], "rb") as f:
+                        download_files.append(("mono", result["mono_path"], "번역본 다운로드"))
+
+                if output_format in ["dual", "both"] and result.get("dual_path"):
+                    if os.path.exists(result["dual_path"]):
+                        download_files.append(("dual", result["dual_path"], "이중언어 다운로드"))
+
+                if result.get("ocr_path"):
+                    if os.path.exists(result["ocr_path"]):
+                        download_files.append(("ocr", result["ocr_path"], "OCR 번역본 (이미지 포함)"))
+
+                if download_files:
+                    cols = st.columns(len(download_files))
+                    for i, (file_type, file_path, label) in enumerate(download_files):
+                        with cols[i]:
+                            with open(file_path, "rb") as f:
+                                suffix = {
+                                    "mono": "_번역본",
+                                    "dual": "_이중언어",
+                                    "ocr": "_OCR번역"
+                                }.get(file_type, "")
                                 st.download_button(
-                                    "번역본만 다운로드",
+                                    label,
                                     f.read(),
-                                    f"{uploaded_file.name.replace('.pdf', '')}_번역본.pdf",
+                                    f"{uploaded_file.name.replace('.pdf', '')}{suffix}.pdf",
                                     "application/pdf",
                                     use_container_width=True
                                 )
 
-                if output_format in ["dual", "both"] and result.get("dual_path"):
-                    if os.path.exists(result["dual_path"]):
-                        with col2:
-                            with open(result["dual_path"], "rb") as f:
-                                st.download_button(
-                                    "이중언어 PDF 다운로드",
-                                    f.read(),
-                                    f"{uploaded_file.name.replace('.pdf', '')}_이중언어.pdf",
-                                    "application/pdf",
-                                    use_container_width=True
-                                )
+                # OCR 번역에 대한 안내
+                if result.get("ocr_path"):
+                    st.info("**OCR 번역본**: 그림/차트 내 텍스트가 번역된 이미지 기반 PDF입니다.")
 
                 # 저장 경로 표시
                 if settings.get("download_path"):
