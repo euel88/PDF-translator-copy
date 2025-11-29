@@ -437,9 +437,23 @@ class PDFConverter:
                 text_width = text_bbox[2] - text_bbox[0]
                 text_height = text_bbox[3] - text_bbox[1]
 
-            # 텍스트 위치 (수직 중앙 정렬)
-            text_x = x0
+            # 텍스트 위치 계산
+            # 멀티라인: 왼쪽 정렬 (더 자연스러움), 단일 라인: 수평 중앙 정렬
+            is_multiline = '\n' in translation
+            if is_multiline:
+                # 멀티라인은 왼쪽 정렬, 약간의 패딩 적용
+                padding = 2
+                text_x = x0 + padding
+            else:
+                # 단일 라인은 수평 중앙 정렬
+                text_x = x0 + (box_width - text_width) // 2
+
+            # 수직 중앙 정렬
             text_y = y0 + (box_height - text_height) // 2
+
+            # 텍스트가 영역을 벗어나지 않도록 보정
+            text_x = max(x0, text_x)
+            text_y = max(y0, text_y)
 
             # 텍스트 그리기
             draw.text((text_x, text_y), translation, font=font, fill=block.color)
@@ -455,10 +469,12 @@ class PDFConverter:
         font_size: int,
         font_name: str
     ) -> Tuple[str, ImageFont.FreeTypeFont]:
-        """텍스트를 박스에 맞게 조정"""
-        min_font_size = 8
+        """텍스트를 박스에 맞게 조정 - 개선된 오버플로우 처리"""
+        # 더 낮은 최소 폰트 크기 (작은 셀에 대응)
+        min_font_size = 6
         current_size = font_size
 
+        # 더 공격적인 폰트 크기 축소 (15%씩)
         while current_size >= min_font_size:
             font = self._get_font(current_size, font_name)
 
@@ -471,12 +487,33 @@ class PDFConverter:
             if text_width <= box_width and text_height <= box_height:
                 return wrapped, font
 
-            # 폰트 크기 축소
-            current_size = int(current_size * 0.9)
+            # 폰트 크기 축소 (15%씩 - 더 빠르게 감소)
+            current_size = int(current_size * 0.85)
 
-        # 최소 크기로 반환
+        # 최소 크기에서도 맞지 않으면 텍스트 잘라내기
         font = self._get_font(min_font_size, font_name)
         wrapped = self._wrap_text(draw, text, font, box_width)
+
+        # 높이가 맞지 않으면 줄 수 제한
+        lines = wrapped.split('\n')
+        if len(lines) > 1:
+            # 한 줄씩 테스트하며 맞는 줄 수 찾기
+            for num_lines in range(len(lines), 0, -1):
+                test_text = '\n'.join(lines[:num_lines])
+                if num_lines < len(lines):
+                    # 잘린 경우 마지막에 "..." 추가
+                    last_line = lines[num_lines - 1]
+                    if len(last_line) > 3:
+                        test_text = '\n'.join(lines[:num_lines - 1] + [last_line[:-3] + "..."])
+                    else:
+                        test_text = '\n'.join(lines[:num_lines - 1] + ["..."])
+
+                text_bbox = draw.textbbox((0, 0), test_text, font=font)
+                text_height = text_bbox[3] - text_bbox[1]
+
+                if text_height <= box_height:
+                    return test_text, font
+
         return wrapped, font
 
     def _wrap_text(
@@ -486,7 +523,7 @@ class PDFConverter:
         font: ImageFont.FreeTypeFont,
         max_width: int
     ) -> str:
-        """텍스트 줄바꿈"""
+        """텍스트 줄바꿈 - 긴 단어도 문자 단위로 분리"""
         words = text.split()
         if not words:
             return text
@@ -495,16 +532,43 @@ class PDFConverter:
         current_line = []
 
         for word in words:
-            test_line = ' '.join(current_line + [word])
-            bbox = draw.textbbox((0, 0), test_line, font=font)
-            width = bbox[2] - bbox[0]
+            # 단어가 너비를 초과하는지 확인
+            word_bbox = draw.textbbox((0, 0), word, font=font)
+            word_width = word_bbox[2] - word_bbox[0]
 
-            if width <= max_width:
-                current_line.append(word)
-            else:
+            if word_width > max_width:
+                # 현재 라인이 있으면 먼저 저장
                 if current_line:
                     lines.append(' '.join(current_line))
-                current_line = [word]
+                    current_line = []
+
+                # 긴 단어를 문자 단위로 분리
+                char_line = ""
+                for char in word:
+                    test_char = char_line + char
+                    char_bbox = draw.textbbox((0, 0), test_char, font=font)
+                    char_width = char_bbox[2] - char_bbox[0]
+
+                    if char_width <= max_width:
+                        char_line = test_char
+                    else:
+                        if char_line:
+                            lines.append(char_line)
+                        char_line = char
+
+                if char_line:
+                    current_line = [char_line]
+            else:
+                test_line = ' '.join(current_line + [word])
+                bbox = draw.textbbox((0, 0), test_line, font=font)
+                width = bbox[2] - bbox[0]
+
+                if width <= max_width:
+                    current_line.append(word)
+                else:
+                    if current_line:
+                        lines.append(' '.join(current_line))
+                    current_line = [word]
 
         if current_line:
             lines.append(' '.join(current_line))
