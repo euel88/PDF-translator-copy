@@ -1,0 +1,18 @@
+# PDF 처리
+PyMuPDF>=1.23.0
+
+# OCR
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# GUI
+PyQt5>=5.15.0
+
+# 번역 서비스
+openai>=1.0.0
+deep-translator>=1.11.0
+deepl>=1.16.0
+ollama>=0.1.0
+
+# 유틸리티
+numpy>=1.24.0
