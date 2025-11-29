@@ -104,7 +104,8 @@ class ImageTranslator:
                 # 기본: Google 번역
                 translator = GoogleTranslator(
                     lang_in=lang_in,
-                    lang_out=lang_out
+                    lang_out=lang_out,
+                    model="google"
                 )
 
             return translator.translate(text)
