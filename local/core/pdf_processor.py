@@ -106,7 +106,6 @@ class PDFProcessor:
 
         # DPI에 맞춰 줌 계산 (기본 72 DPI)
         zoom = self.dpi / 72
-        matrix = type(page).identity_matrix * zoom
 
         # 페이지를 픽스맵으로 렌더링
         import fitz
