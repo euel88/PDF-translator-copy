@@ -1,17 +1,22 @@
+# PDFMathTranslate - System Dependencies for Streamlit Cloud
+# Minimal set to avoid package conflicts
+
+# OpenGL libraries (required for opencv-python-headless)
 libgl1
+libgl1-mesa-glx
 libglib2.0-0
+
+# X11 dependencies
 libsm6
 libxext6
 libxrender1
+
+# OpenMP (parallel processing)
 libgomp1
-libglib2.0-dev
-libgl1-mesa-glx
-libopencv-dev
-python3-opencv
-libmupdf-dev
-mupdf-tools
-libfreetype6-dev
+
+# Font support for CJK languages
 fonts-noto-cjk
 fonts-liberation
-wget
-curl
+
+# FreeType for font rendering
+libfreetype6-dev
