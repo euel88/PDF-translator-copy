@@ -212,12 +212,23 @@ class PDFHandler:
     def extract_text_blocks_scaled(
         self,
         page_num: int,
-        min_text_len: int = 1
+        min_text_len: int = 1,
+        merge_paragraphs: bool = False,
     ) -> List[TextBlock]:
         """
         이미지 좌표로 스케일된 텍스트 블록 추출
+
+        Args:
+            page_num: 페이지 번호
+            min_text_len: 최소 텍스트 길이
+            merge_paragraphs: 문단 단위로 병합할지 여부
         """
         blocks = self.extract_text_blocks(page_num, min_text_len)
+
+        # 문단 병합
+        if merge_paragraphs:
+            blocks = self._merge_paragraph_blocks(blocks)
+
         scale = self.get_scale_factor(page_num)
 
         scaled_blocks = []
@@ -237,6 +248,87 @@ class PDFHandler:
             ))
 
         return scaled_blocks
+
+    def _merge_paragraph_blocks(
+        self,
+        blocks: List[TextBlock],
+        y_threshold: float = 5.0,
+        x_overlap_ratio: float = 0.3,
+    ) -> List[TextBlock]:
+        """
+        같은 문단의 텍스트 블록을 병합
+
+        Args:
+            blocks: 텍스트 블록 리스트
+            y_threshold: Y 좌표 허용 오차 (같은 줄 판단)
+            x_overlap_ratio: X 겹침 비율 (같은 컬럼 판단)
+        """
+        if not blocks:
+            return []
+
+        # Y 좌표로 정렬
+        sorted_blocks = sorted(blocks, key=lambda b: (b.y0, b.x0))
+
+        merged = []
+        current_group = [sorted_blocks[0]]
+
+        for block in sorted_blocks[1:]:
+            last = current_group[-1]
+
+            # 같은 문단인지 판단
+            # 1. Y 위치가 비슷한가 (같은 줄)
+            # 2. 또는 연속된 줄인가 (Y가 조금 아래)
+            y_gap = block.y0 - last.y1
+            same_paragraph = (
+                y_gap < last.height * 1.5 and  # 줄 간격이 적당
+                y_gap > -y_threshold  # 겹치지 않음
+            )
+
+            # X 범위가 비슷한가 (같은 컬럼)
+            x_overlap = min(block.x1, last.x1) - max(block.x0, last.x0)
+            min_width = min(block.width, last.width)
+            same_column = x_overlap > min_width * x_overlap_ratio if min_width > 0 else False
+
+            # 폰트 크기가 비슷한가
+            size_similar = abs(block.font_size - last.font_size) < 2
+
+            if same_paragraph and same_column and size_similar:
+                current_group.append(block)
+            else:
+                # 그룹 병합
+                merged.append(self._merge_block_group(current_group))
+                current_group = [block]
+
+        # 마지막 그룹
+        merged.append(self._merge_block_group(current_group))
+
+        return merged
+
+    def _merge_block_group(self, group: List[TextBlock]) -> TextBlock:
+        """블록 그룹을 하나로 병합"""
+        if len(group) == 1:
+            return group[0]
+
+        # 텍스트 합치기
+        text = " ".join(b.text for b in group)
+
+        # 바운딩 박스
+        x0 = min(b.x0 for b in group)
+        y0 = min(b.y0 for b in group)
+        x1 = max(b.x1 for b in group)
+        y1 = max(b.y1 for b in group)
+
+        # 첫 번째 블록의 스타일 사용
+        first = group[0]
+
+        return TextBlock(
+            text=text,
+            bbox=(x0, y0, x1, y1),
+            font_size=first.font_size,
+            font_name=first.font_name,
+            color=first.color,
+            block_type="text",
+        )
 
     def render_pages(
         self, start: int = 0, end: int = None
