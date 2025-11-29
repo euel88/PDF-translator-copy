@@ -114,6 +114,10 @@ class PDFConverter:
         use_layout_detection: bool = False,
         use_ocr: bool = False,
         source_lang: str = "eng",
+        # 최적화 옵션
+        output_quality: int = 85,  # JPEG 품질 (1-100)
+        use_vector_text: bool = True,  # 벡터 텍스트 사용 (파일 크기 대폭 감소)
+        compress_images: bool = True,  # 이미지 압축 사용
     ):
         self.translator = translator
         self.dpi = dpi
@@ -122,6 +126,11 @@ class PDFConverter:
         self.use_ocr = use_ocr
         self.source_lang = source_lang
         self._cancelled = False
+
+        # 최적화 옵션
+        self.output_quality = output_quality
+        self.use_vector_text = use_vector_text
+        self.compress_images = compress_images
 
         # 레이아웃 감지기
         self.layout_detector = LayoutDetector() if use_layout_detection else None
@@ -166,37 +175,14 @@ class PDFConverter:
 
             self._log(f"총 {len(pages)} 페이지 처리")
 
-            translated_images = []
-
-            for idx, page_num in enumerate(pages):
-                if self._cancelled:
-                    return TranslateResult(error="취소됨")
-
-                self._log(f"페이지 {page_num + 1}/{doc.page_count} 처리 중...")
-
-                # 페이지 렌더링
-                page = doc[page_num]
-                img = self._render_page(page)
-
-                # 레이아웃 감지 (옵션)
-                layout_boxes = None
-                if self.layout_detector:
-                    layout_boxes = self.layout_detector.detect(img)
-                    self._log(f"  레이아웃 영역: {len(layout_boxes)}개")
-
-                # 텍스트 추출
-                blocks = self._extract_blocks(page, img, layout_boxes)
-                self._log(f"  텍스트 블록: {len(blocks)}개")
-
-                if blocks:
-                    # 번역
-                    img = self._translate_page(img, blocks)
-
-                translated_images.append(img)
-
-            # PDF 생성
-            self._log("PDF 생성 중...")
-            mono_pdf = self._create_pdf(translated_images)
+            # 벡터 텍스트 모드: 원본 PDF를 직접 수정
+            if self.use_vector_text:
+                self._log("벡터 텍스트 모드 사용 (파일 크기 최적화)")
+                mono_pdf = self._convert_vector_mode(doc, pages)
+            else:
+                # 이미지 모드: 기존 방식 (호환성용)
+                self._log("이미지 모드 사용")
+                mono_pdf = self._convert_image_mode(doc, pages)
 
             if output_path:
                 with open(output_path, "wb") as f:
@@ -215,6 +201,260 @@ class PDFConverter:
         except Exception as e:
             self._log(f"오류: {str(e)}")
             return TranslateResult(error=str(e))
+
+    def _convert_vector_mode(
+        self,
+        doc: fitz.Document,
+        pages: List[int]
+    ) -> bytes:
+        """
+        벡터 모드 변환 - 원본 PDF 구조 유지, 텍스트만 교체
+        파일 크기가 원본과 비슷하게 유지됨
+        """
+        # 원본 문서 복사
+        output_doc = fitz.open()
+
+        for idx, page_num in enumerate(pages):
+            if self._cancelled:
+                break
+
+            self._log(f"페이지 {page_num + 1}/{doc.page_count} 처리 중...")
+
+            # 원본 페이지 복사
+            page = doc[page_num]
+            output_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            new_page = output_doc[-1]
+
+            # 텍스트 블록 추출
+            blocks = self._extract_blocks_for_vector(page)
+            self._log(f"  텍스트 블록: {len(blocks)}개")
+
+            if not blocks:
+                continue
+
+            # 번역할 블록 필터링 (수식 제외)
+            to_translate = [b for b in blocks if not b.is_formula]
+
+            if not to_translate:
+                continue
+
+            # 배치 번역
+            texts = []
+            formulas_map = {}
+
+            for i, block in enumerate(to_translate):
+                text, formulas = FormulaDetector.extract_formulas(block.text)
+                texts.append(text)
+                formulas_map[i] = formulas
+
+            translations = self.translator.translate_batch(texts)
+
+            # 수식 복원
+            for i, trans in enumerate(translations):
+                if i in formulas_map and formulas_map[i]:
+                    translations[i] = FormulaDetector.restore_formulas(trans, formulas_map[i])
+
+            # 벡터 텍스트 교체
+            self._replace_text_vector(new_page, to_translate, translations)
+
+        # 압축 옵션으로 저장
+        output = io.BytesIO()
+        output_doc.save(
+            output,
+            garbage=4,  # 최대 가비지 컬렉션
+            deflate=True,  # 압축 사용
+            clean=True,  # 사용하지 않는 객체 제거
+        )
+        output_doc.close()
+
+        return output.getvalue()
+
+    def _extract_blocks_for_vector(self, page: fitz.Page) -> List[TextBlock]:
+        """벡터 모드용 텍스트 블록 추출 (스케일 없음)"""
+        blocks = []
+
+        page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                line_text = ""
+                line_spans = []
+
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if text:
+                        line_text += text + " "
+                        line_spans.append(span)
+
+                line_text = line_text.strip()
+                if not line_text or len(line_text) < 2:
+                    continue
+
+                # 바운딩 박스 (스케일 없음 - 원본 좌표)
+                x0 = min(s["bbox"][0] for s in line_spans)
+                y0 = min(s["bbox"][1] for s in line_spans)
+                x1 = max(s["bbox"][2] for s in line_spans)
+                y1 = max(s["bbox"][3] for s in line_spans)
+
+                first = line_spans[0]
+                font_size = first.get("size", 12)
+                font_name = first.get("font", "")
+
+                color_int = first.get("color", 0)
+                r = (color_int >> 16) & 0xFF
+                g = (color_int >> 8) & 0xFF
+                b = color_int & 0xFF
+
+                is_formula = FormulaDetector.is_formula(line_text)
+
+                blocks.append(TextBlock(
+                    text=line_text,
+                    bbox=(x0, y0, x1, y1),
+                    font_size=font_size,
+                    font_name=font_name,
+                    color=(r, g, b),
+                    is_formula=is_formula,
+                ))
+
+        return blocks
+
+    def _replace_text_vector(
+        self,
+        page: fitz.Page,
+        blocks: List[TextBlock],
+        translations: List[str]
+    ):
+        """벡터 방식으로 텍스트 교체 - PyMuPDF 사용"""
+        for block, translation in zip(blocks, translations):
+            x0, y0, x1, y1 = block.bbox
+            rect = fitz.Rect(x0, y0, x1, y1)
+
+            # 원본 텍스트 영역을 흰색으로 덮기
+            # 배경색 감지를 위한 간단한 휴리스틱 (대부분 흰색)
+            page.draw_rect(rect, color=None, fill=(1, 1, 1))
+
+            # 번역된 텍스트 삽입
+            # 폰트 크기 조정 (번역 텍스트가 더 길 수 있음)
+            font_size = block.font_size
+            text_color = tuple(c / 255 for c in block.color)
+
+            # 폰트 선택 (한글 지원)
+            fontname = self._get_vector_fontname(block.font_name)
+
+            # 텍스트가 박스에 맞도록 크기 조정
+            adjusted_size, fitted_text = self._fit_text_vector(
+                page, translation, rect, font_size, fontname
+            )
+
+            # 텍스트 삽입
+            try:
+                # 텍스트 박스로 삽입 (자동 줄바꿈)
+                page.insert_textbox(
+                    rect,
+                    fitted_text,
+                    fontsize=adjusted_size,
+                    fontname=fontname,
+                    color=text_color,
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+            except Exception:
+                # 폴백: 기본 폰트 사용
+                try:
+                    page.insert_textbox(
+                        rect,
+                        fitted_text,
+                        fontsize=adjusted_size,
+                        fontname="helv",
+                        color=text_color,
+                        align=fitz.TEXT_ALIGN_LEFT,
+                    )
+                except Exception:
+                    pass  # 실패해도 계속 진행
+
+    def _get_vector_fontname(self, font_name: str) -> str:
+        """벡터 텍스트용 폰트 이름 반환"""
+        font_name_lower = font_name.lower()
+
+        # PyMuPDF 내장 폰트 중 선택
+        # 한글 지원을 위해 korea1 CJK 폰트 사용 시도
+        if any(s in font_name_lower for s in ["bold", "heavy"]):
+            return "china-s"  # CJK 폰트 (한글 포함)
+        elif any(s in font_name_lower for s in ["serif", "times", "batang"]):
+            return "china-s"
+        else:
+            return "china-s"  # 기본적으로 CJK 폰트 사용
+
+    def _fit_text_vector(
+        self,
+        page: fitz.Page,
+        text: str,
+        rect: fitz.Rect,
+        font_size: float,
+        fontname: str
+    ) -> Tuple[float, str]:
+        """벡터 텍스트를 박스에 맞게 조정"""
+        min_size = 6
+        current_size = font_size
+
+        while current_size >= min_size:
+            # 텍스트 맞춤 테스트
+            try:
+                rc = page.insert_textbox(
+                    rect,
+                    text,
+                    fontsize=current_size,
+                    fontname=fontname,
+                    overlay=False,  # 실제 삽입하지 않음 (테스트만)
+                )
+                if rc >= 0:  # 성공
+                    return current_size, text
+            except Exception:
+                pass
+
+            current_size = int(current_size * 0.85)
+
+        # 최소 크기로 시도
+        return min_size, text
+
+    def _convert_image_mode(
+        self,
+        doc: fitz.Document,
+        pages: List[int]
+    ) -> bytes:
+        """이미지 모드 변환 - 기존 방식 (호환성용)"""
+        translated_images = []
+
+        for idx, page_num in enumerate(pages):
+            if self._cancelled:
+                break
+
+            self._log(f"페이지 {page_num + 1}/{doc.page_count} 처리 중...")
+
+            # 페이지 렌더링
+            page = doc[page_num]
+            img = self._render_page(page)
+
+            # 레이아웃 감지 (옵션)
+            layout_boxes = None
+            if self.layout_detector:
+                layout_boxes = self.layout_detector.detect(img)
+                self._log(f"  레이아웃 영역: {len(layout_boxes)}개")
+
+            # 텍스트 추출
+            blocks = self._extract_blocks(page, img, layout_boxes)
+            self._log(f"  텍스트 블록: {len(blocks)}개")
+
+            if blocks:
+                # 번역
+                img = self._translate_page(img, blocks)
+
+            translated_images.append(img)
+
+        # PDF 생성 (압축 옵션 적용)
+        return self._create_pdf(translated_images)
 
     def _render_page(self, page: fitz.Page) -> Image.Image:
         """페이지 렌더링"""
@@ -734,12 +974,29 @@ class PDFConverter:
         return ImageFont.load_default()
 
     def _create_pdf(self, images: List[Image.Image]) -> bytes:
-        """이미지에서 PDF 생성"""
+        """이미지에서 PDF 생성 - 압축 최적화"""
         doc = fitz.open()
 
         for img in images:
             buf = io.BytesIO()
-            img.save(buf, format="PNG")
+
+            # 이미지 압축 옵션 적용
+            if self.compress_images:
+                # JPEG로 압축 (PNG보다 크기 대폭 감소)
+                # RGB 모드로 변환 (JPEG는 RGBA 미지원)
+                if img.mode == "RGBA":
+                    # 알파 채널을 흰색 배경으로 병합
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[3])
+                    img = background
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+
+                img.save(buf, format="JPEG", quality=self.output_quality, optimize=True)
+            else:
+                # 압축 없이 PNG 사용
+                img.save(buf, format="PNG")
+
             buf.seek(0)
 
             page = doc.new_page(width=img.width, height=img.height)
@@ -747,7 +1004,13 @@ class PDFConverter:
             page.insert_image(rect, stream=buf.getvalue())
 
         output = io.BytesIO()
-        doc.save(output)
+        # PDF 압축 옵션 적용
+        doc.save(
+            output,
+            garbage=4,  # 최대 가비지 컬렉션
+            deflate=True,  # 압축 사용
+            clean=True,  # 사용하지 않는 객체 제거
+        )
         doc.close()
 
         return output.getvalue()

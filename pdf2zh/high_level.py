@@ -37,6 +37,10 @@ def translate(
     pages: Optional[List[int]] = None,
     dpi: int = 150,
     callback: Optional[Callable[[str], None]] = None,
+    # 최적화 옵션
+    output_quality: int = 85,  # JPEG 품질 (1-100, 이미지 모드용)
+    use_vector_text: bool = True,  # 벡터 텍스트 사용 (파일 크기 대폭 감소)
+    compress_images: bool = True,  # 이미지 압축 사용
     **kwargs
 ) -> TranslateResult:
     """
@@ -51,6 +55,9 @@ def translate(
         pages: 번역할 페이지 목록 (PDF만 해당, None이면 전체)
         dpi: 렌더링 DPI (PDF만 해당)
         callback: 로그 콜백 함수
+        output_quality: JPEG 품질 1-100 (이미지 모드용, 기본 85)
+        use_vector_text: 벡터 텍스트 사용 여부 (True면 파일 크기 대폭 감소)
+        compress_images: 이미지 압축 사용 여부
         **kwargs: 번역기 추가 옵션
 
     Returns:
@@ -80,7 +87,10 @@ def translate(
     if file_type == 'PDF':
         return _translate_pdf(
             input_path, output_path, translator,
-            pages, dpi, callback
+            pages, dpi, callback,
+            output_quality=output_quality,
+            use_vector_text=use_vector_text,
+            compress_images=compress_images,
         )
     else:
         return _translate_document(
@@ -95,7 +105,10 @@ def _translate_pdf(
     translator: BaseTranslator,
     pages: Optional[List[int]],
     dpi: int,
-    callback: Optional[Callable[[str], None]]
+    callback: Optional[Callable[[str], None]],
+    output_quality: int = 85,
+    use_vector_text: bool = True,
+    compress_images: bool = True,
 ) -> TranslateResult:
     """PDF 번역"""
     # 출력 경로 자동 생성
@@ -103,11 +116,14 @@ def _translate_pdf(
         inp = Path(input_path)
         output_path = str(inp.parent / f"{inp.stem}_translated.pdf")
 
-    # 변환기 생성 및 실행
+    # 변환기 생성 및 실행 (최적화 옵션 적용)
     converter = PDFConverter(
         translator=translator,
         dpi=dpi,
         callback=callback,
+        output_quality=output_quality,
+        use_vector_text=use_vector_text,
+        compress_images=compress_images,
     )
 
     return converter.convert(
