@@ -5,16 +5,17 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional, List
+from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QSpinBox,
     QFileDialog, QProgressBar, QTextEdit, QGroupBox,
     QSplitter, QScrollArea, QMessageBox, QStatusBar,
-    QToolBar, QAction, QFrame
+    QToolBar, QAction, QFrame, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont
+from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont, QTextCursor
 
 from PIL import Image
 import numpy as np
@@ -33,6 +34,7 @@ class TranslationWorker(QThread):
     """번역 작업 스레드"""
 
     progress = pyqtSignal(int, str)  # 진행률, 메시지
+    log_message = pyqtSignal(str)  # 상세 로그 메시지
     page_completed = pyqtSignal(int, object)  # 페이지 번호, 이미지
     finished = pyqtSignal(bool, str)  # 성공 여부, 메시지
     error = pyqtSignal(str)
@@ -55,32 +57,46 @@ class TranslationWorker(QThread):
         """작업 취소"""
         self._is_cancelled = True
 
+    def _log(self, message: str):
+        """로그 메시지 전송"""
+        self.log_message.emit(message)
+
     def run(self):
         """번역 작업 실행"""
         try:
             # 초기화
             self.progress.emit(0, "초기화 중...")
+            self._log("=" * 40)
+            self._log("번역 작업 시작")
+            self._log(f"입력: {self.pdf_path}")
+            self._log(f"출력: {self.output_path}")
 
             # OCR 엔진 초기화
+            self._log("OCR 엔진 초기화 중...")
             ocr = OCREngine()
             ocr_lang = OCR_LANGUAGES.get(
-                self.config.config.source_lang, "en"
+                self.config.config.source_lang, "eng"
             )
             ocr.set_language(ocr_lang)
+            self._log(f"OCR 언어: {ocr_lang}")
 
             # 번역기 초기화
+            self._log("번역기 초기화 중...")
             translator = OpenAITranslator(
                 api_key=self.config.config.openai_api_key,
                 model=self.config.config.openai_model,
                 source_lang=self.config.config.source_lang,
                 target_lang=self.config.config.target_lang
             )
+            self._log(f"번역: {self.config.config.source_lang} → {self.config.config.target_lang}")
+            self._log(f"모델: {self.config.config.openai_model}")
 
             # 이미지 편집기 초기화
             editor = ImageEditor(self.config.config.font_path or None)
 
             # PDF 처리
             self.progress.emit(5, "PDF 로딩 중...")
+            self._log("PDF 로딩 중...")
 
             with PDFProcessor(
                 self.pdf_path,
@@ -88,6 +104,8 @@ class TranslationWorker(QThread):
             ) as processor:
 
                 page_count = processor.get_page_count()
+                self._log(f"총 페이지: {page_count}")
+                self._log(f"렌더링 DPI: {self.config.config.render_dpi}")
 
                 # 페이지 범위 결정
                 if self.page_range:
@@ -97,11 +115,15 @@ class TranslationWorker(QThread):
                 else:
                     start, end = 0, page_count - 1
 
+                self._log(f"처리 범위: {start + 1} ~ {end + 1} 페이지")
+                self._log("=" * 40)
+
                 total_pages = end - start + 1
                 translated_images = []
 
                 for idx, page_num in enumerate(range(start, end + 1)):
                     if self._is_cancelled:
+                        self._log("사용자에 의해 취소됨")
                         self.finished.emit(False, "사용자에 의해 취소됨")
                         return
 
@@ -111,60 +133,80 @@ class TranslationWorker(QThread):
                         f"페이지 {page_num + 1}/{page_count} 처리 중..."
                     )
 
+                    self._log(f"\n[페이지 {page_num + 1}/{page_count}]")
+
                     # 페이지 렌더링
+                    self._log("  렌더링 중...")
                     page_image = processor.render_page(page_num)
                     pil_image = page_image.image
+                    self._log(f"  이미지 크기: {pil_image.width}x{pil_image.height}")
 
                     # OCR
-                    self.progress.emit(
-                        progress_pct,
-                        f"페이지 {page_num + 1} OCR 중..."
-                    )
+                    self._log("  OCR 실행 중...")
                     ocr_result = ocr.extract_text_from_pil(
                         pil_image,
                         self.config.config.ocr_confidence_threshold
                     )
 
-                    if ocr_result.regions:
-                        # 번역
-                        self.progress.emit(
-                            progress_pct,
-                            f"페이지 {page_num + 1} 번역 중..."
-                        )
+                    self._log(f"  감지된 텍스트 영역: {len(ocr_result.regions)}개")
 
+                    if ocr_result.regions:
+                        # 감지된 텍스트 로그
+                        for i, region in enumerate(ocr_result.regions[:5]):  # 최대 5개만 표시
+                            text_preview = region.text[:30] + "..." if len(region.text) > 30 else region.text
+                            self._log(f"    [{i+1}] {text_preview} (신뢰도: {region.confidence:.2f})")
+
+                        if len(ocr_result.regions) > 5:
+                            self._log(f"    ... 외 {len(ocr_result.regions) - 5}개")
+
+                        # 번역
+                        self._log("  번역 중...")
                         texts = [r.text for r in ocr_result.regions]
                         translations = translator.translate_batch(texts)
 
-                        # 이미지에 번역 적용
-                        self.progress.emit(
-                            progress_pct,
-                            f"페이지 {page_num + 1} 이미지 편집 중..."
-                        )
+                        # 번역 결과 로그
+                        for i, (orig, trans) in enumerate(zip(texts[:3], translations[:3])):
+                            orig_preview = orig[:20] + "..." if len(orig) > 20 else orig
+                            trans_preview = trans[:20] + "..." if len(trans) > 20 else trans
+                            self._log(f"    [{i+1}] \"{orig_preview}\" → \"{trans_preview}\"")
 
+                        if len(texts) > 3:
+                            self._log(f"    ... 외 {len(texts) - 3}개 번역됨")
+
+                        # 이미지에 번역 적용
+                        self._log("  이미지 편집 중...")
                         translated_img = editor.replace_all_text(
                             pil_image,
                             ocr_result.regions,
                             translations,
                             erase_method="inpaint"
                         )
+                        self._log("  편집 완료")
                     else:
-                        # OCR 결과 없으면 원본 이미지 사용
+                        self._log("  텍스트 없음 - 원본 이미지 유지")
                         translated_img = pil_image
 
                     translated_images.append(translated_img)
                     self.page_completed.emit(page_num, translated_img)
+                    self._log(f"  페이지 {page_num + 1} 완료")
 
                 # PDF 생성
+                self._log("\n" + "=" * 40)
                 self.progress.emit(95, "PDF 생성 중...")
+                self._log("PDF 생성 중...")
                 PDFProcessor.create_pdf_from_images(
                     translated_images,
                     self.output_path
                 )
 
                 self.progress.emit(100, "완료!")
+                self._log(f"PDF 저장됨: {self.output_path}")
+                self._log("번역 작업 완료!")
+                self._log("=" * 40)
                 self.finished.emit(True, f"번역 완료: {self.output_path}")
 
         except Exception as e:
+            self._log(f"\n오류 발생: {str(e)}")
             self.error.emit(str(e))
             self.finished.emit(False, f"오류 발생: {e}")
 
@@ -447,12 +489,36 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.preview_widget)
 
         # 로그
-        log_group = QGroupBox("로그")
+        log_group = QGroupBox("실시간 로그")
         log_layout = QVBoxLayout(log_group)
 
+        # 로그 컨트롤
+        log_control_layout = QHBoxLayout()
+
+        self.auto_scroll_check = QCheckBox("자동 스크롤")
+        self.auto_scroll_check.setChecked(True)
+        log_control_layout.addWidget(self.auto_scroll_check)
+
+        log_control_layout.addStretch()
+
+        clear_log_btn = QPushButton("로그 지우기")
+        clear_log_btn.clicked.connect(self._clear_log)
+        log_control_layout.addWidget(clear_log_btn)
+
+        log_layout.addLayout(log_control_layout)
+
+        # 로그 텍스트
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setMinimumHeight(200)
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 12px;
+            }
+        """)
         log_layout.addWidget(self.log_text)
 
         layout.addWidget(log_group)
@@ -519,6 +585,7 @@ class MainWindow(QMainWindow):
                 self.translate_btn.setEnabled(True)
                 self.statusbar.showMessage(f"PDF 로드됨: {info.page_count} 페이지")
                 self._log(f"PDF 열림: {file_path}")
+                self._log(f"총 {info.page_count} 페이지")
 
             except Exception as e:
                 QMessageBox.critical(self, "오류", f"PDF 로드 실패: {e}")
@@ -563,6 +630,9 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
+        # 로그 초기화
+        self._clear_log()
+
         # 페이지 범위
         start = self.start_page_spin.value() - 1  # 0-based
         end = self.end_page_spin.value() - 1
@@ -576,6 +646,7 @@ class MainWindow(QMainWindow):
         )
 
         self.worker.progress.connect(self._on_progress)
+        self.worker.log_message.connect(self._on_log_message)
         self.worker.page_completed.connect(self._on_page_completed)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -585,7 +656,6 @@ class MainWindow(QMainWindow):
         # UI 상태 변경
         self.translate_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self._log("번역 시작...")
 
     def _cancel_translation(self):
         """번역 취소"""
@@ -599,10 +669,13 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
         self.statusbar.showMessage(message)
 
+    def _on_log_message(self, message: str):
+        """로그 메시지 수신"""
+        self._log(message)
+
     def _on_page_completed(self, page_num: int, image: Image.Image):
         """페이지 완료"""
         self.preview_widget.set_image(image)
-        self._log(f"페이지 {page_num + 1} 완료")
 
     def _on_finished(self, success: bool, message: str):
         """번역 완료"""
@@ -610,10 +683,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
 
         if success:
-            self._log(message)
             QMessageBox.information(self, "완료", message)
-        else:
-            self._log(f"실패: {message}")
 
         self.statusbar.showMessage("준비됨")
 
@@ -623,8 +693,20 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "오류", error_msg)
 
     def _log(self, message: str):
-        """로그 추가"""
-        self.log_text.append(message)
+        """로그 추가 (타임스탬프 포함)"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[{timestamp}] {message}"
+        self.log_text.append(formatted_msg)
+
+        # 자동 스크롤
+        if self.auto_scroll_check.isChecked():
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.log_text.setTextCursor(cursor)
+
+    def _clear_log(self):
+        """로그 지우기"""
+        self.log_text.clear()
 
     def closeEvent(self, event):
         """창 닫기 이벤트"""
