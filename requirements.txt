@@ -1,40 +1,28 @@
-# PDFMathTranslate - Dependencies
-# Based on: https://github.com/PDFMathTranslate/PDFMathTranslate
-
-# Core
 streamlit>=1.28.0
 pdf2zh>=1.9.0
 
-# PDF Processing
 PyPDF2>=3.0.0
-pymupdf>=1.23.0,<1.25.3
+pymupdf>=1.23.0
 pikepdf>=8.0.0
 pdfminer.six>=20231228
 
-# Image Processing (CPU only for cloud compatibility)
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
-numpy<2.0.0
+numpy>=2.0.0
 
-# Translation Services
 requests>=2.31.0
 tenacity>=8.2.0
 openai>=1.0.0
 
-# Font Handling
 fonttools>=4.43.0
 
-# ONNX (Layout Detection)
 onnx>=1.14.0
 onnxruntime>=1.16.0
 
-# Database (Translation Cache)
 peewee>=3.17.0
 
-# Model Download
 huggingface-hub>=0.19.0
 
-# Utilities
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 psutil>=5.9.0
