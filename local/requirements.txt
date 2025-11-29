@@ -1,0 +1,22 @@
+# PDF Translator Local - Dependencies
+
+# GUI
+PyQt5>=5.15.0
+
+# PDF Processing
+PyMuPDF>=1.23.0
+
+# OCR
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Translation
+openai>=1.0.0
+
+# Utilities
+python-dotenv>=1.0.0
