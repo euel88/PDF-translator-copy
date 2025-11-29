@@ -3,6 +3,12 @@ Image Text Editor Module
 이미지 내 텍스트를 편집하는 모듈
 
 원본 텍스트를 지우고 번역된 텍스트로 교체
+
+개선사항:
+- 텍스트 자동 줄바꿈
+- 동적 폰트 크기 조정
+- 정확한 텍스트 위치 계산
+- 다국어 폰트 지원 강화
 """
 
 import logging
@@ -10,6 +16,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 from pathlib import Path
+import textwrap
 
 logger = logging.getLogger(__name__)
 
@@ -53,37 +60,60 @@ class ImageTextEditor:
         """적절한 폰트 로드"""
         from PIL import ImageFont
 
-        # 폰트 경로 후보들
-        font_paths = [
-            # Linux 시스템 폰트
+        # 캐시된 폰트 경로 사용
+        if hasattr(self, '_cached_font_path') and self._cached_font_path:
+            try:
+                return ImageFont.truetype(self._cached_font_path, size)
+            except Exception:
+                pass
+
+        # 폰트 경로 후보들 (CJK 폰트 우선)
+        font_paths = []
+
+        # babeldoc에서 다운로드한 폰트 경로 확인 (우선순위 높음)
+        try:
+            from babeldoc.assets.assets import get_font_and_metadata
+            # GoNotoKurrent는 다국어 지원이 좋음
+            font_name = "GoNotoKurrent-Regular.ttf"
+            cached_font, _ = get_font_and_metadata(font_name)
+            font_paths.append(str(cached_font))
+        except Exception:
+            pass
+
+        # 홈 디렉토리의 babeldoc 캐시 확인
+        try:
+            import os
+            home = os.path.expanduser("~")
+            babeldoc_cache = os.path.join(home, ".cache", "babeldoc", "fonts")
+            if os.path.exists(babeldoc_cache):
+                for font_file in os.listdir(babeldoc_cache):
+                    if font_file.endswith(('.ttf', '.otf', '.ttc')):
+                        font_paths.append(os.path.join(babeldoc_cache, font_file))
+        except Exception:
+            pass
+
+        # Linux 시스템 폰트
+        font_paths.extend([
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            # 시스템 폰트 디렉토리
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ]
-
-        # babeldoc에서 다운로드한 폰트 경로 확인
-        try:
-            from babeldoc.assets.assets import get_font_and_metadata
-            font_name = "GoNotoKurrent-Regular.ttf"
-            if lang in ["ko", "ja", "zh", "zh-cn", "zh-tw"]:
-                font_name = "SourceHanSerifCN-Regular.ttf"
-            cached_font, _ = get_font_and_metadata(font_name)
-            font_paths.insert(0, str(cached_font))
-        except Exception:
-            pass
+        ])
 
         # 사용 가능한 폰트 찾기
         for font_path in font_paths:
             try:
                 if Path(font_path).exists():
+                    self._cached_font_path = font_path
+                    logger.debug(f"폰트 로드: {font_path}")
                     return ImageFont.truetype(font_path, size)
             except Exception:
                 continue
 
         # 기본 폰트 사용
+        logger.warning("적절한 폰트를 찾을 수 없어 기본 폰트 사용")
         try:
             return ImageFont.load_default()
         except Exception:
@@ -93,15 +123,17 @@ class ImageTextEditor:
         self,
         bbox: Tuple[int, int, int, int],
         text: str,
-        max_iterations: int = 10
+        max_iterations: int = 20,
+        lang: str = "en"
     ) -> int:
         """
-        bbox에 맞는 폰트 크기 추정
+        bbox에 맞는 폰트 크기 추정 (개선된 알고리즘)
 
         Args:
             bbox: 텍스트 영역 (x1, y1, x2, y2)
             text: 삽입할 텍스트
             max_iterations: 최대 반복 횟수
+            lang: 대상 언어
 
         Returns:
             적절한 폰트 크기
@@ -111,31 +143,172 @@ class ImageTextEditor:
         width = bbox[2] - bbox[0]
         height = bbox[3] - bbox[1]
 
-        # 초기 추정 (높이 기반)
-        font_size = max(int(height * 0.8), 10)
+        if width <= 0 or height <= 0:
+            return 12
+
+        # 초기 추정: 높이 기반이지만 텍스트 길이도 고려
+        # 한 줄에 들어갈 수 있는 대략적인 문자 수 추정
+        avg_char_width_ratio = 0.6  # 평균 문자 너비 비율
+        estimated_chars_per_line = max(1, int(width / (height * avg_char_width_ratio)))
+
+        # 텍스트가 한 줄에 들어갈 수 있으면 높이 기반
+        if len(text) <= estimated_chars_per_line:
+            font_size = max(int(height * 0.85), 8)
+        else:
+            # 여러 줄이 필요하면 더 작은 폰트 시작
+            lines_needed = (len(text) / estimated_chars_per_line) + 1
+            font_size = max(int(height / lines_needed * 0.9), 8)
+
+        min_font_size = 8
+        max_font_size = max(int(height * 0.95), 10)
+
+        best_font_size = min_font_size
 
         for _ in range(max_iterations):
-            font = self._get_font(font_size)
+            font = self._get_font(font_size, lang)
             if font is None:
-                return font_size
+                return max(font_size, min_font_size)
 
             try:
-                # 텍스트 크기 측정
-                bbox_text = font.getbbox(text)
-                text_width = bbox_text[2] - bbox_text[0]
-                text_height = bbox_text[3] - bbox_text[1]
+                # 텍스트를 줄바꿈하여 실제 필요한 크기 계산
+                wrapped_text = self._wrap_text(text, font, width)
+                lines = wrapped_text.split('\n')
+
+                # 전체 텍스트 높이 계산
+                total_height = 0
+                max_line_width = 0
+                line_height = font_size * 1.2  # 줄 간격
+
+                for line in lines:
+                    if line.strip():
+                        text_bbox = font.getbbox(line)
+                        line_width = text_bbox[2] - text_bbox[0]
+                        max_line_width = max(max_line_width, line_width)
+                    total_height += line_height
 
                 # 크기 조정
-                if text_width > width or text_height > height:
-                    font_size = int(font_size * 0.9)
-                elif text_width < width * 0.5 and text_height < height * 0.5:
-                    font_size = int(font_size * 1.1)
+                fits_width = max_line_width <= width * 1.05  # 5% 여유
+                fits_height = total_height <= height * 1.05
+
+                if fits_width and fits_height:
+                    best_font_size = font_size
+                    # 더 큰 크기 시도
+                    if font_size < max_font_size:
+                        font_size = min(int(font_size * 1.1), max_font_size)
+                    else:
+                        break
                 else:
-                    break
-            except Exception:
+                    # 크기 줄이기
+                    font_size = int(font_size * 0.9)
+                    if font_size < min_font_size:
+                        break
+
+            except Exception as e:
+                logger.debug(f"폰트 크기 추정 오류: {e}")
                 break
 
-        return max(font_size, 8)
+        return max(best_font_size, min_font_size)
+
+    def _wrap_text(
+        self,
+        text: str,
+        font,
+        max_width: int
+    ) -> str:
+        """
+        텍스트를 주어진 너비에 맞게 줄바꿈
+
+        Args:
+            text: 원본 텍스트
+            font: PIL 폰트 객체
+            max_width: 최대 너비 (픽셀)
+
+        Returns:
+            줄바꿈된 텍스트
+        """
+        if font is None:
+            return text
+
+        words = text.split()
+        if not words:
+            return text
+
+        lines = []
+        current_line = []
+        current_width = 0
+
+        for word in words:
+            try:
+                word_bbox = font.getbbox(word + " ")
+                word_width = word_bbox[2] - word_bbox[0]
+            except Exception:
+                word_width = len(word) * 10  # 추정값
+
+            if current_width + word_width <= max_width:
+                current_line.append(word)
+                current_width += word_width
+            else:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                current_line = [word]
+                current_width = word_width
+
+        if current_line:
+            lines.append(" ".join(current_line))
+
+        return "\n".join(lines) if lines else text
+
+    def _calculate_text_position(
+        self,
+        bbox: Tuple[int, int, int, int],
+        text: str,
+        font,
+        align: str = "center"
+    ) -> Tuple[int, int]:
+        """
+        텍스트 위치 계산 (개선된 알고리즘)
+
+        Args:
+            bbox: 영역 (x1, y1, x2, y2)
+            text: 텍스트
+            font: 폰트 객체
+            align: 정렬 방식 (left, center, right)
+
+        Returns:
+            (x, y) 위치
+        """
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+
+        if font:
+            try:
+                text_bbox = font.getbbox(text)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+                # ascent/descent 고려
+                ascent = -text_bbox[1]  # 보통 음수
+            except Exception:
+                text_width = len(text) * 10
+                text_height = 12
+                ascent = 10
+        else:
+            text_width = len(text) * 10
+            text_height = 12
+            ascent = 10
+
+        # X 위치 계산
+        if align == "left":
+            x = x1 + 2  # 약간의 패딩
+        elif align == "right":
+            x = x2 - text_width - 2
+        else:  # center
+            x = x1 + (width - text_width) // 2
+
+        # Y 위치: 수직 중앙 정렬, baseline 고려
+        y = y1 + (height - text_height) // 2
+
+        return max(x, x1), max(y, y1)
 
     def _get_dominant_color(
         self,
@@ -188,19 +361,42 @@ class ImageTextEditor:
         """
         import cv2
 
+        if not polygon or len(polygon) < 3:
+            return image
+
+        img_height, img_width = image.shape[:2]
+
+        # polygon 좌표 검증 및 클리핑
+        valid_polygon = []
+        for pt in polygon:
+            if len(pt) >= 2:
+                x = max(0, min(int(pt[0]), img_width - 1))
+                y = max(0, min(int(pt[1]), img_height - 1))
+                valid_polygon.append([x, y])
+
+        if len(valid_polygon) < 3:
+            return image
+
         # 마스크 생성
         mask = np.zeros(image.shape[:2], dtype=np.uint8)
-        pts = np.array(polygon, dtype=np.int32)
+        pts = np.array(valid_polygon, dtype=np.int32)
         cv2.fillPoly(mask, [pts], 255)
+
+        # 마스크가 비어있으면 원본 반환
+        if np.sum(mask) == 0:
+            return image
 
         # 마스크 확장 (텍스트 경계 포함)
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.dilate(mask, kernel, iterations=2)
 
         # 인페인팅
-        result = cv2.inpaint(image, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-
-        return result
+        try:
+            result = cv2.inpaint(image, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            return result
+        except Exception as e:
+            logger.debug(f"인페인팅 실패: {e}")
+            return image
 
     def _fill_region_with_color(
         self,
@@ -221,8 +417,24 @@ class ImageTextEditor:
         """
         import cv2
 
+        if not polygon or len(polygon) < 3:
+            return image
+
+        img_height, img_width = image.shape[:2]
+
+        # polygon 좌표 검증 및 클리핑
+        valid_polygon = []
+        for pt in polygon:
+            if len(pt) >= 2:
+                x = max(0, min(int(pt[0]), img_width - 1))
+                y = max(0, min(int(pt[1]), img_height - 1))
+                valid_polygon.append([x, y])
+
+        if len(valid_polygon) < 3:
+            return image
+
         result = image.copy()
-        pts = np.array(polygon, dtype=np.int32)
+        pts = np.array(valid_polygon, dtype=np.int32)
         # BGR 색상으로 변환
         bgr_color = (color[2], color[1], color[0])
         cv2.fillPoly(result, [pts], bgr_color)
@@ -237,7 +449,7 @@ class ImageTextEditor:
         use_inpaint: bool = True
     ) -> np.ndarray:
         """
-        이미지 내 텍스트 교체
+        이미지 내 텍스트 교체 (개선된 버전)
 
         Args:
             image: numpy 배열 이미지 (BGR)
@@ -257,14 +469,12 @@ class ImageTextEditor:
 
         result = image.copy()
 
+        # 먼저 모든 텍스트 영역을 인페인팅/지우기
         for replacement in replacements:
             try:
-                # 1. 원본 텍스트 영역 처리
                 if use_inpaint:
-                    # 인페인팅으로 원본 텍스트 제거
                     result = self._inpaint_region(result, replacement.polygon)
                 else:
-                    # 배경색으로 채우기
                     bg_color = replacement.background_color
                     if bg_color is None:
                         bg_color = self._get_dominant_color(
@@ -273,19 +483,35 @@ class ImageTextEditor:
                     result = self._fill_region_with_color(
                         result, replacement.polygon, bg_color
                     )
+            except Exception as e:
+                logger.debug(f"텍스트 영역 지우기 실패: {e}")
 
-                # 2. 번역된 텍스트 삽입
-                # BGR to RGB for PIL
-                result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(result_rgb)
-                draw = ImageDraw.Draw(pil_image)
+        # BGR to RGB for PIL
+        result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(result_rgb)
+        draw = ImageDraw.Draw(pil_image)
 
-                # 폰트 크기 결정
+        # 번역된 텍스트 삽입
+        for replacement in replacements:
+            try:
+                x1, y1, x2, y2 = replacement.bbox
+                box_width = x2 - x1
+                box_height = y2 - y1
+
+                if box_width <= 0 or box_height <= 0:
+                    continue
+
+                translated_text = replacement.translated_text.strip()
+                if not translated_text:
+                    continue
+
+                # 폰트 크기 결정 (개선된 알고리즘 사용)
                 font_size = replacement.font_size
                 if font_size is None:
                     font_size = self._estimate_font_size(
                         replacement.bbox,
-                        replacement.translated_text
+                        translated_text,
+                        lang=lang
                     )
 
                 font = self._get_font(font_size, lang)
@@ -298,28 +524,51 @@ class ImageTextEditor:
                     brightness = (bg[0] * 299 + bg[1] * 587 + bg[2] * 114) / 1000
                     text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
 
-                # 텍스트 위치 계산 (중앙 정렬)
-                x1, y1, x2, y2 = replacement.bbox
-                if font:
-                    text_bbox = font.getbbox(replacement.translated_text)
-                    text_width = text_bbox[2] - text_bbox[0]
-                    text_height = text_bbox[3] - text_bbox[1]
-                else:
-                    text_width = len(replacement.translated_text) * font_size // 2
-                    text_height = font_size
+                # 텍스트를 bbox에 맞게 줄바꿈
+                wrapped_text = self._wrap_text(translated_text, font, box_width - 4)
+                lines = wrapped_text.split('\n')
 
-                x = x1 + (x2 - x1 - text_width) // 2
-                y = y1 + (y2 - y1 - text_height) // 2
+                # 줄 높이 계산
+                line_height = font_size * 1.2
 
-                # 텍스트 그리기
-                draw.text((x, y), replacement.translated_text, fill=text_color, font=font)
+                # 전체 텍스트 높이 계산
+                total_text_height = len(lines) * line_height
 
-                # RGB to BGR
-                result = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+                # 시작 Y 위치 (수직 중앙 정렬)
+                start_y = y1 + (box_height - total_text_height) / 2
+
+                # 각 줄 그리기
+                for i, line in enumerate(lines):
+                    if not line.strip():
+                        continue
+
+                    # 이 줄의 너비 계산
+                    if font:
+                        try:
+                            line_bbox = font.getbbox(line)
+                            line_width = line_bbox[2] - line_bbox[0]
+                        except Exception:
+                            line_width = len(line) * font_size // 2
+                    else:
+                        line_width = len(line) * font_size // 2
+
+                    # X 위치 (수평 중앙 정렬)
+                    x = x1 + (box_width - line_width) // 2
+                    y = start_y + i * line_height
+
+                    # 경계 확인
+                    x = max(x1, min(x, x2 - line_width))
+                    y = max(y1, min(y, y2 - font_size))
+
+                    # 텍스트 그리기
+                    draw.text((x, y), line, fill=text_color, font=font)
 
             except Exception as e:
-                logger.error(f"텍스트 교체 실패: {e}")
+                logger.error(f"텍스트 교체 실패 '{replacement.translated_text[:20]}...': {e}")
                 continue
+
+        # RGB to BGR
+        result = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
         return result
 

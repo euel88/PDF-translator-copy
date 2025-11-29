@@ -138,9 +138,13 @@ class ImageTranslator:
             ImageTranslationResult: 번역 결과
         """
         try:
-            # 1. OCR 수행
+            # 이미지 크기 확인
+            img_height, img_width = image.shape[:2]
+            logger.debug(f"이미지 크기: {img_width}x{img_height}")
+
+            # 1. OCR 수행 (merge_nearby=False로 변경하여 더 정확한 위치 사용)
             logger.info("OCR 수행 중...")
-            ocr_result = ocr_image(image, lang_in, merge_nearby=True)
+            ocr_result = ocr_image(image, lang_in, merge_nearby=False)
 
             if not ocr_result.regions:
                 logger.info("이미지에서 텍스트를 찾을 수 없습니다")
@@ -164,9 +168,39 @@ class ImageTranslator:
                 if len(region.text.strip()) < min_text_length:
                     continue
 
+                # bbox 유효성 검사
+                x1, y1, x2, y2 = region.bbox
+                if x1 < 0 or y1 < 0 or x2 > img_width or y2 > img_height:
+                    # 경계 내로 클리핑
+                    x1 = max(0, min(x1, img_width))
+                    y1 = max(0, min(y1, img_height))
+                    x2 = max(0, min(x2, img_width))
+                    y2 = max(0, min(y2, img_height))
+
+                if x2 <= x1 or y2 <= y1:
+                    logger.debug(f"잘못된 bbox 건너뜀: {region.bbox}")
+                    continue
+
+                # 너무 작은 영역 건너뛰기
+                box_width = x2 - x1
+                box_height = y2 - y1
+                if box_width < 10 or box_height < 10:
+                    continue
+
+                # polygon도 클리핑
+                valid_polygon = []
+                for pt in region.polygon:
+                    px = max(0, min(pt[0], img_width))
+                    py = max(0, min(pt[1], img_height))
+                    valid_polygon.append([int(px), int(py)])
+
                 # 번역
                 original_text = region.text.strip()
                 translated_text = self.translator_func(original_text, lang_in, lang_out)
+
+                # 번역이 실패하거나 빈 경우 건너뛰기
+                if not translated_text or translated_text == original_text:
+                    continue
 
                 translations.append({
                     "original": original_text,
@@ -176,8 +210,8 @@ class ImageTranslator:
                 replacements.append(TextReplacement(
                     original_text=original_text,
                     translated_text=translated_text,
-                    bbox=region.bbox,
-                    polygon=region.polygon
+                    bbox=(int(x1), int(y1), int(x2), int(y2)),
+                    polygon=valid_polygon
                 ))
 
             # 3. 이미지 편집
@@ -200,6 +234,8 @@ class ImageTranslator:
 
         except Exception as e:
             logger.error(f"이미지 번역 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return ImageTranslationResult(
                 original_image=image,
                 translated_image=image.copy(),
