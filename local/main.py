@@ -2,10 +2,12 @@
 """
 PDF Translator Local - 로컬 PDF 번역기
 
-PaddleOCR + OpenAI를 사용한 PDF 이미지 번역기
+Tesseract OCR + OpenAI를 사용한 PDF 이미지 번역기
 """
 import sys
 import subprocess
+import platform
+import os
 from pathlib import Path
 
 # 경로 설정
@@ -17,8 +19,7 @@ sys.path.insert(0, str(APP_DIR))
 PACKAGE_MAP = {
     "PyQt5": "PyQt5",
     "fitz": "PyMuPDF",
-    "paddleocr": "paddleocr",
-    "paddlepaddle": "paddlepaddle",
+    "pytesseract": "pytesseract",
     "openai": "openai",
     "cv2": "opencv-python",
     "PIL": "Pillow",
@@ -42,6 +43,31 @@ def install_package(package_name: str) -> bool:
         return False
 
 
+def check_tesseract_installed() -> bool:
+    """Tesseract OCR 엔진 설치 확인"""
+    if platform.system() == "Windows":
+        possible_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expanduser(r"~\AppData\Local\Tesseract-OCR\tesseract.exe"),
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return True
+        return False
+    else:
+        # Linux/Mac: which 명령으로 확인
+        try:
+            subprocess.check_call(
+                ["which", "tesseract"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+
 def check_and_install_dependencies() -> bool:
     """의존성 확인 및 자동 설치"""
     missing = []
@@ -58,17 +84,11 @@ def check_and_install_dependencies() -> bool:
     except ImportError:
         missing.append("fitz")
 
-    # PaddlePaddle (PaddleOCR 의존성)
+    # pytesseract
     try:
-        import paddle
+        import pytesseract
     except ImportError:
-        missing.append("paddlepaddle")
-
-    # PaddleOCR
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError:
-        missing.append("paddleocr")
+        missing.append("pytesseract")
 
     # OpenAI
     try:
@@ -94,34 +114,57 @@ def check_and_install_dependencies() -> bool:
     except ImportError:
         missing.append("numpy")
 
-    if not missing:
-        return True
+    if missing:
+        print("=" * 50)
+        print("필요한 패키지를 자동 설치합니다...")
+        print("=" * 50)
 
-    print("=" * 50)
-    print("필요한 패키지를 자동 설치합니다...")
-    print("=" * 50)
+        failed = []
+        for module_name in missing:
+            package_name = PACKAGE_MAP.get(module_name, module_name)
+            if not install_package(package_name):
+                failed.append(package_name)
 
-    failed = []
-    for module_name in missing:
-        package_name = PACKAGE_MAP.get(module_name, module_name)
-        if not install_package(package_name):
-            failed.append(package_name)
+        if failed:
+            print()
+            print("=" * 50)
+            print("다음 패키지 설치에 실패했습니다:")
+            for pkg in failed:
+                print(f"  - {pkg}")
+            print()
+            print("수동 설치:")
+            print(f"  pip install {' '.join(failed)}")
+            print("=" * 50)
+            return False
 
-    if failed:
+        print()
+        print("모든 Python 패키지가 설치되었습니다!")
+        print("=" * 50)
+
+    # Tesseract OCR 엔진 확인
+    if not check_tesseract_installed():
         print()
         print("=" * 50)
-        print("다음 패키지 설치에 실패했습니다:")
-        for pkg in failed:
-            print(f"  - {pkg}")
+        print("Tesseract OCR 엔진이 설치되지 않았습니다!")
         print()
-        print("수동 설치:")
-        print(f"  pip install {' '.join(failed)}")
+        if platform.system() == "Windows":
+            print("Windows 설치 방법:")
+            print("  1. https://github.com/UB-Mannheim/tesseract/wiki 에서 다운로드")
+            print("  2. tesseract-ocr-w64-setup-xxx.exe 실행")
+            print("  3. 설치 시 'Additional language data' 에서 필요한 언어 선택")
+            print("     - Korean, Japanese, Chinese 등")
+        elif platform.system() == "Darwin":
+            print("macOS 설치 방법:")
+            print("  brew install tesseract")
+            print("  brew install tesseract-lang  # 추가 언어")
+        else:
+            print("Linux 설치 방법:")
+            print("  sudo apt install tesseract-ocr")
+            print("  sudo apt install tesseract-ocr-kor  # 한국어")
+            print("  sudo apt install tesseract-ocr-jpn  # 일본어")
         print("=" * 50)
         return False
 
-    print()
-    print("모든 패키지가 설치되었습니다!")
-    print("=" * 50)
     return True
 
 
@@ -129,6 +172,7 @@ def main():
     """메인 함수"""
     # 의존성 확인 및 자동 설치
     if not check_and_install_dependencies():
+        input("\n아무 키나 누르면 종료합니다...")
         sys.exit(1)
 
     # PyQt 앱 시작
