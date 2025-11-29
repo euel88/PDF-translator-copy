@@ -414,11 +414,21 @@ def download_remote_fonts(lang: str):
     }
     font_name = LANG_NAME_MAP.get(lang, "GoNotoKurrent-Regular.ttf")
 
-    # docker
-    font_path = ConfigManager.get("NOTO_FONT_PATH", Path("/app", font_name).as_posix())
-    if not Path(font_path).exists():
-        font_path, _ = get_font_and_metadata(font_name)
-        font_path = font_path.as_posix()
+    # Check for custom font path in config (without setting a default that may cause permission errors)
+    font_path = ConfigManager.get("NOTO_FONT_PATH", None)
+
+    # If custom path exists and file is accessible, use it
+    if font_path:
+        try:
+            if Path(font_path).exists():
+                logger.info(f"use font: {font_path}")
+                return font_path
+        except (PermissionError, OSError):
+            pass
+
+    # Use babeldoc to download/get font (works on Streamlit Cloud)
+    font_path, _ = get_font_and_metadata(font_name)
+    font_path = font_path.as_posix()
 
     logger.info(f"use font: {font_path}")
 
