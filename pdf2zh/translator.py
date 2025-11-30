@@ -4,6 +4,7 @@
 """
 import re
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +24,7 @@ class BaseTranslator(ABC):
 
     # 기본 병렬 처리 설정
     DEFAULT_NUM_THREADS = 5  # 기본 병렬 스레드 수 (속도 5배 향상)
-    MAX_CONCURRENT_BATCHES = 3  # 동시 배치 요청 수
+    MAX_CONCURRENT_BATCHES = 5  # 동시 배치 요청 수 (3 → 5로 증가)
 
     def __init__(self, source_lang: str, target_lang: str, **kwargs):
         self.source_lang = source_lang
@@ -197,7 +198,7 @@ class OpenAITranslator(BaseTranslator):
             from openai import OpenAI
             kwargs = {
                 "api_key": self.api_key,
-                "timeout": 180.0,  # 120 → 180초 타임아웃 (대용량 배치용)
+                "timeout": 120.0,  # 타임아웃 120초로 최적화
             }
             if self.base_url:
                 kwargs["base_url"] = self.base_url
@@ -236,12 +237,14 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리"""
+        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리, 시간 표시"""
         if not texts:
             return []
 
+        batch_start_time = time.time()
         results = texts.copy()
         to_translate = []
+        cached_count = 0
 
         # 캐시 확인
         for i, text in enumerate(texts):
@@ -251,32 +254,47 @@ Rules:
                 cached = cache.get(text, self.source_lang, self.target_lang, self.name)
                 if cached:
                     results[i] = cached
+                    cached_count += 1
                     continue
             to_translate.append((i, text))
 
         if not to_translate:
+            elapsed = time.time() - batch_start_time
+            if cached_count > 0:
+                print(f"[OpenAI] 캐시에서 {cached_count}개 로드 ({elapsed:.1f}초)")
             return results
 
         # 스마트 배치 분할 (개수 + 문자 수 기준)
         batches = self._create_smart_batches(to_translate)
         total_batches = len(batches)
 
-        if total_batches > 1:
-            print(f"[OpenAI] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치")
+        if cached_count > 0:
+            print(f"[OpenAI] 캐시 {cached_count}개 적중, 번역 필요 {len(to_translate)}개")
 
-        # 병렬 배치 처리 (최대 3개 동시 실행)
+        if total_batches > 1:
+            print(f"[OpenAI] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치 (병렬 처리)")
+
+        # 병렬 배치 처리 (최대 5개 동시 실행)
+        completed_batches = [0]  # 리스트로 감싸서 클로저에서 수정 가능
+        batch_lock = threading.Lock()
+
         if total_batches > 1 and self.num_threads > 1:
             batch_results_map = {}
 
             def process_batch(batch_idx: int, batch_items: List[tuple]) -> tuple:
+                batch_item_start = time.time()
                 try:
                     batch_result = self._translate_batch_safe(batch_items)
+                    batch_elapsed = time.time() - batch_item_start
+                    with batch_lock:
+                        completed_batches[0] += 1
+                        print(f"[OpenAI] 배치 {completed_batches[0]}/{total_batches} 완료 ({len(batch_items)}개, {batch_elapsed:.1f}초)")
                     return (batch_idx, batch_result)
                 except Exception as e:
                     print(f"[OpenAI] 배치 {batch_idx+1} 오류: {e}")
                     return (batch_idx, [item[1] for item in batch_items])
 
-            with ThreadPoolExecutor(max_workers=min(3, total_batches)) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.MAX_CONCURRENT_BATCHES, total_batches)) as executor:
                 futures = {
                     executor.submit(process_batch, idx, batch): idx
                     for idx, batch in enumerate(batches)
@@ -295,13 +313,21 @@ Rules:
                                   self.name, translated)
         else:
             # 순차 처리 (배치가 적거나 단일 스레드)
-            for batch in batches:
+            for batch_idx, batch in enumerate(batches):
+                batch_item_start = time.time()
                 batch_results = self._translate_batch_safe(batch)
+                batch_elapsed = time.time() - batch_item_start
+                if total_batches > 1:
+                    print(f"[OpenAI] 배치 {batch_idx+1}/{total_batches} 완료 ({len(batch)}개, {batch_elapsed:.1f}초)")
                 for (orig_idx, orig_text), translated in zip(batch, batch_results):
                     results[orig_idx] = translated
                     if self.use_cache and translated != orig_text:
                         cache.set(orig_text, self.source_lang, self.target_lang,
                                   self.name, translated)
+
+        total_elapsed = time.time() - batch_start_time
+        items_per_sec = len(to_translate) / total_elapsed if total_elapsed > 0 else 0
+        print(f"[OpenAI] 번역 완료: {len(to_translate)}개 / {total_elapsed:.1f}초 ({items_per_sec:.1f}개/초)")
 
         return results
 
@@ -505,7 +531,7 @@ class ClaudeTranslator(BaseTranslator):
     def client(self):
         if self._client is None:
             from anthropic import Anthropic
-            self._client = Anthropic(api_key=self.api_key, timeout=180.0)
+            self._client = Anthropic(api_key=self.api_key, timeout=120.0)  # 타임아웃 120초로 최적화
         return self._client
 
     def _get_prompt(self) -> str:
@@ -538,12 +564,14 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리"""
+        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리, 시간 표시"""
         if not texts:
             return []
 
+        batch_start_time = time.time()
         results = texts.copy()
         to_translate = []
+        cached_count = 0
 
         # 캐시 확인
         for i, text in enumerate(texts):
@@ -553,32 +581,47 @@ Rules:
                 cached = cache.get(text, self.source_lang, self.target_lang, self.name)
                 if cached:
                     results[i] = cached
+                    cached_count += 1
                     continue
             to_translate.append((i, text))
 
         if not to_translate:
+            elapsed = time.time() - batch_start_time
+            if cached_count > 0:
+                print(f"[Claude] 캐시에서 {cached_count}개 로드 ({elapsed:.1f}초)")
             return results
 
         # 스마트 배치 분할 (개수 + 문자 수 기준)
         batches = self._create_smart_batches(to_translate)
         total_batches = len(batches)
 
-        if total_batches > 1:
-            print(f"[Claude] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치")
+        if cached_count > 0:
+            print(f"[Claude] 캐시 {cached_count}개 적중, 번역 필요 {len(to_translate)}개")
 
-        # 병렬 배치 처리 (최대 3개 동시 실행)
+        if total_batches > 1:
+            print(f"[Claude] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치 (병렬 처리)")
+
+        # 병렬 배치 처리 (최대 5개 동시 실행)
+        completed_batches = [0]  # 리스트로 감싸서 클로저에서 수정 가능
+        batch_lock = threading.Lock()
+
         if total_batches > 1 and self.num_threads > 1:
             batch_results_map = {}
 
             def process_batch(batch_idx: int, batch_items: List[tuple]) -> tuple:
+                batch_item_start = time.time()
                 try:
                     batch_result = self._translate_batch_safe(batch_items)
+                    batch_elapsed = time.time() - batch_item_start
+                    with batch_lock:
+                        completed_batches[0] += 1
+                        print(f"[Claude] 배치 {completed_batches[0]}/{total_batches} 완료 ({len(batch_items)}개, {batch_elapsed:.1f}초)")
                     return (batch_idx, batch_result)
                 except Exception as e:
                     print(f"[Claude] 배치 {batch_idx+1} 오류: {e}")
                     return (batch_idx, [item[1] for item in batch_items])
 
-            with ThreadPoolExecutor(max_workers=min(3, total_batches)) as executor:
+            with ThreadPoolExecutor(max_workers=min(self.MAX_CONCURRENT_BATCHES, total_batches)) as executor:
                 futures = {
                     executor.submit(process_batch, idx, batch): idx
                     for idx, batch in enumerate(batches)
@@ -597,13 +640,21 @@ Rules:
                                   self.name, translated)
         else:
             # 순차 처리 (배치가 적거나 단일 스레드)
-            for batch in batches:
+            for batch_idx, batch in enumerate(batches):
+                batch_item_start = time.time()
                 batch_results = self._translate_batch_safe(batch)
+                batch_elapsed = time.time() - batch_item_start
+                if total_batches > 1:
+                    print(f"[Claude] 배치 {batch_idx+1}/{total_batches} 완료 ({len(batch)}개, {batch_elapsed:.1f}초)")
                 for (orig_idx, orig_text), translated in zip(batch, batch_results):
                     results[orig_idx] = translated
                     if self.use_cache and translated != orig_text:
                         cache.set(orig_text, self.source_lang, self.target_lang,
                                   self.name, translated)
+
+        total_elapsed = time.time() - batch_start_time
+        items_per_sec = len(to_translate) / total_elapsed if total_elapsed > 0 else 0
+        print(f"[Claude] 번역 완료: {len(to_translate)}개 / {total_elapsed:.1f}초 ({items_per_sec:.1f}개/초)")
 
         return results
 

@@ -626,7 +626,9 @@ class PDFConverter:
         # ===== 2단계: 전체 텍스트 일괄 번역 =====
         translate_start_time = time.time()
         if total_texts > 0:
-            self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중...")
+            # 예상 시간 계산 (평균 20개/초 기준)
+            estimated_time = total_texts / 20.0
+            self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중... (예상 {estimated_time:.0f}~{estimated_time*2:.0f}초)")
             all_translations = self.translator.translate_batch(all_texts)
 
             # 번역 결과 검증 및 통계
@@ -645,7 +647,8 @@ class PDFConverter:
                     all_translations[i] = FormulaDetector.restore_formulas(trans, all_formulas[i])
 
             translate_elapsed = time.time() - translate_start_time
-            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {translated_count}/{total_texts}개 성공)")
+            items_per_sec = total_texts / translate_elapsed if translate_elapsed > 0 else 0
+            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {translated_count}/{total_texts}개 성공, {items_per_sec:.1f}개/초)")
         else:
             all_translations = []
             translate_elapsed = 0
@@ -1226,7 +1229,9 @@ class PDFConverter:
         # ===== 2단계: 전체 텍스트 일괄 번역 =====
         translate_start_time = time.time()
         if total_texts > 0:
-            self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중...")
+            # 예상 시간 계산 (평균 20개/초 기준)
+            estimated_time = total_texts / 20.0
+            self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중... (예상 {estimated_time:.0f}~{estimated_time*2:.0f}초)")
             all_translations = self.translator.translate_batch(all_texts)
 
             # 수식 복원
@@ -1235,7 +1240,8 @@ class PDFConverter:
                     all_translations[i] = FormulaDetector.restore_formulas(trans, all_formulas[i])
 
             translate_elapsed = time.time() - translate_start_time
-            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {total_texts}개 항목)")
+            items_per_sec = total_texts / translate_elapsed if translate_elapsed > 0 else 0
+            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {total_texts}개 항목, {items_per_sec:.1f}개/초)")
         else:
             all_translations = []
             translate_elapsed = 0
