@@ -289,7 +289,7 @@ Rules:
             numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
 
         numbered = "\n".join(numbered_parts)
-        prompt = f"""Translate each item. Keep <<<N>>> markers exactly as shown.
+        prompt = f"""Translate each numbered item below. Keep the <<<N>>> markers exactly as shown. Output ALL items with their markers.
 
 {numbered}"""
 
@@ -306,33 +306,49 @@ Rules:
 
             result_text = response.choices[0].message.content.strip()
 
-            # <<<N>>> 패턴으로 파싱
+            # <<<N>>> 패턴으로 파싱 (빈 결과도 허용: .+? -> .*?)
             translations = {}
-            pattern = r'<<<(\d+)>>>\s*(.+?)(?=<<<\d+>>>|$)'
+            # 첫 번째 방법: lookahead 사용
+            pattern = r'<<<(\d+)>>>\s*(.*?)(?=<<<\d+>>>|$)'
             matches = re.findall(pattern, result_text, re.DOTALL)
 
             for num_str, trans_text in matches:
                 num = int(num_str)
                 if 1 <= num <= len(items):
-                    translations[num - 1] = trans_text.strip()
+                    cleaned = trans_text.strip()
+                    if cleaned:  # 빈 문자열이 아닐 때만 저장
+                        translations[num - 1] = cleaned
+
+            # 두 번째 방법: 줄 단위 파싱 (폴백)
+            if len(translations) < len(items) * 0.5:
+                # 절반 이상 실패하면 줄 단위 파싱 시도
+                line_pattern = r'<<<(\d+)>>>\s*(.+)'
+                for line in result_text.split('\n'):
+                    match = re.match(line_pattern, line.strip())
+                    if match:
+                        num = int(match.group(1))
+                        if 1 <= num <= len(items) and (num - 1) not in translations:
+                            cleaned = match.group(2).strip()
+                            if cleaned:
+                                translations[num - 1] = cleaned
 
             # 결과 검증 - 누락된 항목은 개별 번역
             results = []
             missing_count = 0
             for idx, (orig_idx, orig_text) in enumerate(items):
-                if idx in translations:
+                if idx in translations and translations[idx]:
                     results.append(translations[idx])
                 else:
                     missing_count += 1
                     # 개별 번역으로 폴백
                     try:
                         translated = self._translate(orig_text)
-                        results.append(translated)
+                        results.append(translated if translated else orig_text)
                     except Exception:
                         results.append(orig_text)
 
             if missing_count > 0:
-                print(f"[OpenAI] 배치 결과 {missing_count}개 누락 → 개별 번역 완료")
+                print(f"[OpenAI] 배치 결과 {missing_count}/{len(items)}개 누락 → 개별 번역 완료")
 
             return results
 
@@ -344,7 +360,7 @@ Rules:
             for orig_idx, orig_text in items:
                 try:
                     translated = self._translate(orig_text)
-                    results.append(translated)
+                    results.append(translated if translated else orig_text)
                 except Exception as e2:
                     print(f"[OpenAI] 개별 번역 오류: {e2}")
                     results.append(orig_text)
@@ -519,7 +535,7 @@ Rules:
             numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
 
         numbered = "\n".join(numbered_parts)
-        prompt = f"""Translate each item. Keep <<<N>>> markers exactly as shown.
+        prompt = f"""Translate each numbered item below. Keep the <<<N>>> markers exactly as shown. Output ALL items with their markers.
 
 {numbered}"""
 
@@ -533,33 +549,49 @@ Rules:
 
             result_text = message.content[0].text.strip()
 
-            # <<<N>>> 패턴으로 파싱
+            # <<<N>>> 패턴으로 파싱 (빈 결과도 허용: .+? -> .*?)
             translations = {}
-            pattern = r'<<<(\d+)>>>\s*(.+?)(?=<<<\d+>>>|$)'
+            # 첫 번째 방법: lookahead 사용
+            pattern = r'<<<(\d+)>>>\s*(.*?)(?=<<<\d+>>>|$)'
             matches = re.findall(pattern, result_text, re.DOTALL)
 
             for num_str, trans_text in matches:
                 num = int(num_str)
                 if 1 <= num <= len(items):
-                    translations[num - 1] = trans_text.strip()
+                    cleaned = trans_text.strip()
+                    if cleaned:  # 빈 문자열이 아닐 때만 저장
+                        translations[num - 1] = cleaned
+
+            # 두 번째 방법: 줄 단위 파싱 (폴백)
+            if len(translations) < len(items) * 0.5:
+                # 절반 이상 실패하면 줄 단위 파싱 시도
+                line_pattern = r'<<<(\d+)>>>\s*(.+)'
+                for line in result_text.split('\n'):
+                    match = re.match(line_pattern, line.strip())
+                    if match:
+                        num = int(match.group(1))
+                        if 1 <= num <= len(items) and (num - 1) not in translations:
+                            cleaned = match.group(2).strip()
+                            if cleaned:
+                                translations[num - 1] = cleaned
 
             # 결과 검증 - 누락된 항목은 개별 번역
             results = []
             missing_count = 0
             for idx, (orig_idx, orig_text) in enumerate(items):
-                if idx in translations:
+                if idx in translations and translations[idx]:
                     results.append(translations[idx])
                 else:
                     missing_count += 1
                     # 개별 번역으로 폴백
                     try:
                         translated = self._translate(orig_text)
-                        results.append(translated)
+                        results.append(translated if translated else orig_text)
                     except Exception:
                         results.append(orig_text)
 
             if missing_count > 0:
-                print(f"[Claude] 배치 결과 {missing_count}개 누락 → 개별 번역 완료")
+                print(f"[Claude] 배치 결과 {missing_count}/{len(items)}개 누락 → 개별 번역 완료")
 
             return results
 
@@ -571,7 +603,7 @@ Rules:
             for orig_idx, orig_text in items:
                 try:
                     translated = self._translate(orig_text)
-                    results.append(translated)
+                    results.append(translated if translated else orig_text)
                 except Exception as e2:
                     print(f"[Claude] 개별 번역 오류: {e2}")
                     results.append(orig_text)
