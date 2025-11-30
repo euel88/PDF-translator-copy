@@ -232,7 +232,7 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역 (최적화)"""
+        """배치 번역 (최적화) - 결과 검증 및 폴백 강화"""
         if not texts:
             return []
 
@@ -253,9 +253,43 @@ Rules:
         if not to_translate:
             return results
 
-        # 배치 요청
-        numbered = "\n".join(f"[{idx+1}] {t}" for idx, (_, t) in enumerate(to_translate))
-        prompt = f"""Translate each line. Keep [N] format and {{{{vN}}}} placeholders.
+        # 배치가 너무 크면 분할 처리 (출력 토큰 제한 방지)
+        MAX_BATCH_SIZE = 5  # 안전한 배치 크기
+        if len(to_translate) > MAX_BATCH_SIZE:
+            print(f"[OpenAI] 배치 분할: {len(to_translate)}개 → {MAX_BATCH_SIZE}개씩")
+            for batch_start in range(0, len(to_translate), MAX_BATCH_SIZE):
+                batch_items = to_translate[batch_start:batch_start + MAX_BATCH_SIZE]
+                batch_texts = [texts[idx] for idx, _ in batch_items]
+                batch_results = self._translate_batch_safe(batch_items)
+                for (orig_idx, orig_text), translated in zip(batch_items, batch_results):
+                    results[orig_idx] = translated
+                    if self.use_cache and translated != orig_text:
+                        cache.set(orig_text, self.source_lang, self.target_lang,
+                                  self.name, translated)
+            return results
+
+        # 단일 배치 처리
+        batch_results = self._translate_batch_safe(to_translate)
+        for (orig_idx, orig_text), translated in zip(to_translate, batch_results):
+            results[orig_idx] = translated
+            if self.use_cache and translated != orig_text:
+                cache.set(orig_text, self.source_lang, self.target_lang,
+                          self.name, translated)
+
+        return results
+
+    def _translate_batch_safe(self, items: List[tuple]) -> List[str]:
+        """안전한 배치 번역 - 결과 검증 및 개별 폴백"""
+        # 구분자로 <<<N>>> 사용 (줄바꿈 문제 방지)
+        separator = "<<<{idx}>>>"
+        numbered_parts = []
+        for idx, (_, text) in enumerate(items):
+            # 텍스트 내 줄바꿈을 임시로 치환
+            safe_text = text.replace('\n', ' ').replace('\r', ' ')
+            numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
+
+        numbered = "\n".join(numbered_parts)
+        prompt = f"""Translate each item. Keep <<<N>>> markers exactly as shown.
 
 {numbered}"""
 
@@ -267,43 +301,54 @@ Rules:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
+                max_tokens=4096,
             )
 
             result_text = response.choices[0].message.content.strip()
-            translations = []
 
-            for line in result_text.split("\n"):
-                line = line.strip()
-                if line:
-                    cleaned = re.sub(r"^\[\d+\]\s*", "", line)
-                    translations.append(cleaned)
+            # <<<N>>> 패턴으로 파싱
+            translations = {}
+            pattern = r'<<<(\d+)>>>\s*(.+?)(?=<<<\d+>>>|$)'
+            matches = re.findall(pattern, result_text, re.DOTALL)
 
-            for idx, (orig_idx, orig_text) in enumerate(to_translate):
-                if idx < len(translations):
-                    results[orig_idx] = translations[idx]
-                    if self.use_cache:
-                        cache.set(
-                            orig_text, self.source_lang, self.target_lang,
-                            self.name, translations[idx]
-                        )
+            for num_str, trans_text in matches:
+                num = int(num_str)
+                if 1 <= num <= len(items):
+                    translations[num - 1] = trans_text.strip()
+
+            # 결과 검증 - 누락된 항목은 개별 번역
+            results = []
+            missing_count = 0
+            for idx, (orig_idx, orig_text) in enumerate(items):
+                if idx in translations:
+                    results.append(translations[idx])
+                else:
+                    missing_count += 1
+                    # 개별 번역으로 폴백
+                    try:
+                        translated = self._translate(orig_text)
+                        results.append(translated)
+                    except Exception:
+                        results.append(orig_text)
+
+            if missing_count > 0:
+                print(f"[OpenAI] 배치 결과 {missing_count}개 누락 → 개별 번역 완료")
+
+            return results
 
         except Exception as e:
             print(f"[OpenAI] 배치 번역 오류: {e}")
-            # 배치 실패 시 개별 번역으로 폴백
+            # 전체 배치 실패 시 개별 번역
             print("[OpenAI] 개별 번역으로 재시도...")
-            for orig_idx, orig_text in to_translate:
+            results = []
+            for orig_idx, orig_text in items:
                 try:
                     translated = self._translate(orig_text)
-                    results[orig_idx] = translated
-                    if self.use_cache:
-                        cache.set(
-                            orig_text, self.source_lang, self.target_lang,
-                            self.name, translated
-                        )
+                    results.append(translated)
                 except Exception as e2:
                     print(f"[OpenAI] 개별 번역 오류: {e2}")
-
-        return results
+                    results.append(orig_text)
+            return results
 
 
 class GoogleTranslator(BaseTranslator):
@@ -418,7 +463,7 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역"""
+        """배치 번역 - 결과 검증 및 폴백 강화"""
         if not texts:
             return []
 
@@ -439,54 +484,98 @@ Rules:
         if not to_translate:
             return results
 
-        # 배치 요청
-        numbered = "\n".join(f"[{idx+1}] {t}" for idx, (_, t) in enumerate(to_translate))
-        prompt = f"""Translate each line. Keep [N] format and {{{{vN}}}} placeholders.
+        # 배치가 너무 크면 분할 처리 (출력 토큰 제한 방지)
+        MAX_BATCH_SIZE = 5  # 안전한 배치 크기
+        if len(to_translate) > MAX_BATCH_SIZE:
+            print(f"[Claude] 배치 분할: {len(to_translate)}개 → {MAX_BATCH_SIZE}개씩")
+            for batch_start in range(0, len(to_translate), MAX_BATCH_SIZE):
+                batch_items = to_translate[batch_start:batch_start + MAX_BATCH_SIZE]
+                batch_results = self._translate_batch_safe(batch_items)
+                for (orig_idx, orig_text), translated in zip(batch_items, batch_results):
+                    results[orig_idx] = translated
+                    if self.use_cache and translated != orig_text:
+                        cache.set(orig_text, self.source_lang, self.target_lang,
+                                  self.name, translated)
+            return results
+
+        # 단일 배치 처리
+        batch_results = self._translate_batch_safe(to_translate)
+        for (orig_idx, orig_text), translated in zip(to_translate, batch_results):
+            results[orig_idx] = translated
+            if self.use_cache and translated != orig_text:
+                cache.set(orig_text, self.source_lang, self.target_lang,
+                          self.name, translated)
+
+        return results
+
+    def _translate_batch_safe(self, items: List[tuple]) -> List[str]:
+        """안전한 배치 번역 - 결과 검증 및 개별 폴백"""
+        # 구분자로 <<<N>>> 사용 (줄바꿈 문제 방지)
+        separator = "<<<{idx}>>>"
+        numbered_parts = []
+        for idx, (_, text) in enumerate(items):
+            # 텍스트 내 줄바꿈을 임시로 치환
+            safe_text = text.replace('\n', ' ').replace('\r', ' ')
+            numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
+
+        numbered = "\n".join(numbered_parts)
+        prompt = f"""Translate each item. Keep <<<N>>> markers exactly as shown.
 
 {numbered}"""
 
         try:
             message = self.client.messages.create(
                 model=self.model,
-                max_tokens=4096,
+                max_tokens=8192,
                 system=self._get_prompt(),
                 messages=[{"role": "user", "content": prompt}],
             )
 
             result_text = message.content[0].text.strip()
-            translations = []
 
-            for line in result_text.split("\n"):
-                line = line.strip()
-                if line:
-                    cleaned = re.sub(r"^\[\d+\]\s*", "", line)
-                    translations.append(cleaned)
+            # <<<N>>> 패턴으로 파싱
+            translations = {}
+            pattern = r'<<<(\d+)>>>\s*(.+?)(?=<<<\d+>>>|$)'
+            matches = re.findall(pattern, result_text, re.DOTALL)
 
-            for idx, (orig_idx, orig_text) in enumerate(to_translate):
-                if idx < len(translations):
-                    results[orig_idx] = translations[idx]
-                    if self.use_cache:
-                        cache.set(
-                            orig_text, self.source_lang, self.target_lang,
-                            self.name, translations[idx]
-                        )
+            for num_str, trans_text in matches:
+                num = int(num_str)
+                if 1 <= num <= len(items):
+                    translations[num - 1] = trans_text.strip()
+
+            # 결과 검증 - 누락된 항목은 개별 번역
+            results = []
+            missing_count = 0
+            for idx, (orig_idx, orig_text) in enumerate(items):
+                if idx in translations:
+                    results.append(translations[idx])
+                else:
+                    missing_count += 1
+                    # 개별 번역으로 폴백
+                    try:
+                        translated = self._translate(orig_text)
+                        results.append(translated)
+                    except Exception:
+                        results.append(orig_text)
+
+            if missing_count > 0:
+                print(f"[Claude] 배치 결과 {missing_count}개 누락 → 개별 번역 완료")
+
+            return results
 
         except Exception as e:
             print(f"[Claude] 배치 번역 오류: {e}")
-            # 개별 번역으로 폴백
-            for orig_idx, orig_text in to_translate:
+            # 전체 배치 실패 시 개별 번역
+            print("[Claude] 개별 번역으로 재시도...")
+            results = []
+            for orig_idx, orig_text in items:
                 try:
                     translated = self._translate(orig_text)
-                    results[orig_idx] = translated
-                    if self.use_cache:
-                        cache.set(
-                            orig_text, self.source_lang, self.target_lang,
-                            self.name, translated
-                        )
-                except Exception:
-                    pass
-
-        return results
+                    results.append(translated)
+                except Exception as e2:
+                    print(f"[Claude] 개별 번역 오류: {e2}")
+                    results.append(orig_text)
+            return results
 
 
 class XinferenceTranslator(BaseTranslator):

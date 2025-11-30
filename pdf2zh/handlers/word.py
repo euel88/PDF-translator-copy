@@ -45,10 +45,10 @@ class WordHandler(BaseDocumentHandler):
 
     SUPPORTED_EXTENSIONS = ['.docx', '.doc']
 
-    # 대용량 처리 설정
-    BATCH_SIZE_SMALL = 30   # 짧은 텍스트
-    BATCH_SIZE_MEDIUM = 20  # 중간 텍스트
-    BATCH_SIZE_LARGE = 10   # 긴 텍스트
+    # 대용량 처리 설정 (API 출력 토큰 제한 방지를 위해 보수적으로 설정)
+    BATCH_SIZE_SMALL = 10   # 짧은 텍스트 (< 100자)
+    BATCH_SIZE_MEDIUM = 5   # 중간 텍스트 (100-500자)
+    BATCH_SIZE_LARGE = 3    # 긴 텍스트 (> 500자)
 
     def convert(
         self,
