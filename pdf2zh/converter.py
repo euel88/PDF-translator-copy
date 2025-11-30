@@ -629,16 +629,27 @@ class PDFConverter:
             self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중...")
             all_translations = self.translator.translate_batch(all_texts)
 
+            # 번역 결과 검증 및 통계
+            translated_count = sum(1 for i, t in enumerate(all_translations)
+                                   if t and t.strip() and t.strip() != all_texts[i].strip())
+            unchanged_count = sum(1 for i, t in enumerate(all_translations)
+                                  if t and t.strip() == all_texts[i].strip())
+            empty_count = sum(1 for t in all_translations if not t or not t.strip())
+
+            if empty_count > 0 or unchanged_count > total_texts * 0.5:
+                self._log(f"  경고: 번역 실패 {empty_count}개, 변경 없음 {unchanged_count}개")
+
             # 수식 복원
             for i, trans in enumerate(all_translations):
                 if all_formulas[i]:
                     all_translations[i] = FormulaDetector.restore_formulas(trans, all_formulas[i])
 
             translate_elapsed = time.time() - translate_start_time
-            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {total_texts}개 항목)")
+            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {translated_count}/{total_texts}개 성공)")
         else:
             all_translations = []
             translate_elapsed = 0
+            self._log("  경고: 번역할 텍스트가 없습니다.")
 
         # ===== 3단계: 번역 결과 적용 =====
         apply_start_time = time.time()
