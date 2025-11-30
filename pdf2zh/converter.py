@@ -833,7 +833,7 @@ class PDFConverter:
         pixmap: fitz.Pixmap,
         rect: fitz.Rect
     ) -> Tuple[float, float, float]:
-        """Pixmap에서 영역의 배경색 감지 - 개선된 버전"""
+        """Pixmap에서 영역의 배경색 감지 - 더 정확한 버전"""
         try:
             # 영역 주변 샘플링
             x0, y0, x1, y1 = int(rect.x0), int(rect.y0), int(rect.x1), int(rect.y1)
@@ -844,69 +844,88 @@ class PDFConverter:
             y0 = max(0, min(y0, pixmap.height - 1))
             y1 = max(0, min(y1, pixmap.height - 1))
 
-            # 영역 내부 샘플링 (텍스트 영역 자체의 배경색 확인)
-            inner_samples = []
-            inner_step_x = max(1, (x1 - x0) // 8)
-            inner_step_y = max(1, (y1 - y0) // 4)
+            width = x1 - x0
+            height = y1 - y0
 
-            # 영역 내부 모서리와 가장자리에서 샘플링
-            for y in [y0 + 1, y0 + (y1 - y0) // 2, y1 - 1]:
-                for x in range(x0, x1, inner_step_x):
-                    if 0 <= x < pixmap.width and 0 <= y < pixmap.height:
-                        idx = (y * pixmap.width + x) * pixmap.n
-                        if idx + 2 < len(pixmap.samples):
-                            r, g, b = pixmap.samples[idx:idx+3]
-                            inner_samples.append((r, g, b))
+            if width <= 0 or height <= 0:
+                return (1, 1, 1)
 
-            # 내부 샘플에서 가장 밝은 색상 찾기 (배경일 가능성이 높음)
-            # 텍스트는 보통 어둡고 배경은 밝음
-            if inner_samples:
-                # 밝기 기준으로 정렬하여 상위 50% 선택
-                inner_samples.sort(key=lambda c: c[0] + c[1] + c[2], reverse=True)
-                bright_samples = inner_samples[:max(1, len(inner_samples) // 2)]
+            all_samples = []
 
-                # 비슷한 색상 그룹핑
-                inner_groups = self._group_colors(bright_samples)
-                if inner_groups:
-                    largest_inner = max(inner_groups, key=len)
-                    inner_r = sum(c[0] for c in largest_inner) // len(largest_inner)
-                    inner_g = sum(c[1] for c in largest_inner) // len(largest_inner)
-                    inner_b = sum(c[2] for c in largest_inner) // len(largest_inner)
-
-                    # 내부 배경이 충분히 균일하면 사용
-                    if len(largest_inner) >= len(inner_samples) * 0.3:
-                        return (inner_r/255, inner_g/255, inner_b/255)
-
-            # 외부 가장자리 샘플링 (fallback)
-            edge_samples = []
-            step = max(1, (x1 - x0) // 10)
+            # 1. 외부 4방향 가장자리 샘플링 (가장 신뢰할 수 있음)
+            edge_offsets = [1, 2, 3, 5]  # 더 넓은 범위
+            step_x = max(1, width // 15)
+            step_y = max(1, height // 8)
 
             # 상단 가장자리
-            for x in range(x0, x1, step):
-                for offset in [1, 3]:
-                    if y0 > offset:
+            for x in range(x0, x1, step_x):
+                for offset in edge_offsets:
+                    if y0 - offset >= 0:
                         idx = ((y0 - offset) * pixmap.width + x) * pixmap.n
                         if idx + 2 < len(pixmap.samples):
                             r, g, b = pixmap.samples[idx:idx+3]
-                            edge_samples.append((r, g, b))
+                            all_samples.append((r, g, b, 2))  # 가중치 2
 
             # 하단 가장자리
-            for x in range(x0, x1, step):
-                for offset in [1, 3]:
+            for x in range(x0, x1, step_x):
+                for offset in edge_offsets:
                     if y1 + offset < pixmap.height:
                         idx = ((y1 + offset) * pixmap.width + x) * pixmap.n
                         if idx + 2 < len(pixmap.samples):
                             r, g, b = pixmap.samples[idx:idx+3]
-                            edge_samples.append((r, g, b))
+                            all_samples.append((r, g, b, 2))
 
-            if edge_samples:
-                edge_groups = self._group_colors(edge_samples)
-                if edge_groups:
-                    largest_edge = max(edge_groups, key=len)
-                    r = sum(c[0] for c in largest_edge) // len(largest_edge)
-                    g = sum(c[1] for c in largest_edge) // len(largest_edge)
-                    b = sum(c[2] for c in largest_edge) // len(largest_edge)
-                    return (r/255, g/255, b/255)
+            # 좌측 가장자리
+            for y in range(y0, y1, step_y):
+                for offset in edge_offsets:
+                    if x0 - offset >= 0:
+                        idx = (y * pixmap.width + (x0 - offset)) * pixmap.n
+                        if idx + 2 < len(pixmap.samples):
+                            r, g, b = pixmap.samples[idx:idx+3]
+                            all_samples.append((r, g, b, 2))
+
+            # 우측 가장자리
+            for y in range(y0, y1, step_y):
+                for offset in edge_offsets:
+                    if x1 + offset < pixmap.width:
+                        idx = (y * pixmap.width + (x1 + offset)) * pixmap.n
+                        if idx + 2 < len(pixmap.samples):
+                            r, g, b = pixmap.samples[idx:idx+3]
+                            all_samples.append((r, g, b, 2))
+
+            # 2. 4개 코너 샘플링 (외부)
+            corners = [
+                (x0 - 3, y0 - 3), (x1 + 3, y0 - 3),
+                (x0 - 3, y1 + 3), (x1 + 3, y1 + 3)
+            ]
+            for cx, cy in corners:
+                if 0 <= cx < pixmap.width and 0 <= cy < pixmap.height:
+                    idx = (cy * pixmap.width + cx) * pixmap.n
+                    if idx + 2 < len(pixmap.samples):
+                        r, g, b = pixmap.samples[idx:idx+3]
+                        all_samples.append((r, g, b, 3))  # 코너는 가중치 3
+
+            # 3. 샘플 분석 - 가장 일반적인 밝은 색상 찾기
+            if all_samples:
+                # 가중치를 고려한 색상 그룹핑
+                weighted_samples = []
+                for sample in all_samples:
+                    r, g, b = sample[:3]
+                    weight = sample[3] if len(sample) > 3 else 1
+                    for _ in range(weight):
+                        weighted_samples.append((r, g, b))
+
+                # 색상 그룹핑 (더 타이트한 임계값)
+                groups = self._group_colors(weighted_samples, threshold=20)
+
+                if groups:
+                    # 가장 큰 그룹의 평균 색상 사용
+                    largest_group = max(groups, key=len)
+                    avg_r = sum(c[0] for c in largest_group) // len(largest_group)
+                    avg_g = sum(c[1] for c in largest_group) // len(largest_group)
+                    avg_b = sum(c[2] for c in largest_group) // len(largest_group)
+
+                    return (avg_r / 255, avg_g / 255, avg_b / 255)
 
         except Exception:
             pass

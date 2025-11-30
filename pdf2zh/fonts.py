@@ -205,16 +205,40 @@ class FontManager:
         except Exception:
             return None
 
-    def _download_font(self, url: str, target_path: Path) -> Optional[str]:
-        """폰트 다운로드"""
-        try:
-            print(f"폰트 다운로드 중: {url}")
-            urllib.request.urlretrieve(url, str(target_path))
-            print(f"폰트 저장됨: {target_path}")
-            return str(target_path)
-        except Exception as e:
-            print(f"폰트 다운로드 실패: {e}")
-            return None
+    def _download_font(self, url: str, target_path: Path, timeout: int = 30) -> Optional[str]:
+        """폰트 다운로드 (타임아웃 및 재시도 포함)"""
+        import socket
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"폰트 다운로드 중 (시도 {attempt + 1}/{max_retries}): {url}")
+
+                # 타임아웃 설정
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(timeout)
+
+                try:
+                    urllib.request.urlretrieve(url, str(target_path))
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+
+                # 파일 크기 확인 (최소 10KB 이상이어야 유효)
+                if target_path.exists() and target_path.stat().st_size > 10000:
+                    print(f"폰트 저장됨: {target_path}")
+                    return str(target_path)
+                else:
+                    print(f"폰트 파일이 너무 작음, 재시도...")
+                    if target_path.exists():
+                        target_path.unlink()
+
+            except Exception as e:
+                print(f"폰트 다운로드 실패 (시도 {attempt + 1}): {e}")
+                if target_path.exists():
+                    target_path.unlink()
+
+        print(f"폰트 다운로드 최종 실패: {url}")
+        return None
 
     def _find_font_by_name(self, font_name: str) -> Optional[str]:
         """폰트 이름으로 경로 찾기"""
@@ -305,18 +329,33 @@ class FontManager:
         if font_path and Path(font_path).exists():
             return ("custom-font", font_path)
 
-        # PyMuPDF 내장 CJK 폰트 폴백
+        # PyMuPDF 내장 CJK 폰트 폴백 (더 강력한 매핑)
         lang = language.lower()
-        if lang in ("ko", "korean"):
-            return ("korea1", None)
-        elif lang in ("ja", "jp", "japanese"):
+
+        # 한국어
+        if lang in ("ko", "kr", "korean", "kor"):
+            # korea1은 한글 지원, china-s도 한글 일부 지원
+            return ("china-s", None)  # china-s가 더 안정적
+
+        # 일본어
+        elif lang in ("ja", "jp", "japanese", "jpn"):
             return ("japan1", None)
-        elif lang in ("zh", "zh-cn", "chinese"):
+
+        # 중국어 간체
+        elif lang in ("zh", "zh-cn", "chinese", "chi", "zho", "chinese-simplified"):
             return ("china-s", None)
-        elif lang in ("zh-tw", "chinese-traditional"):
+
+        # 중국어 번체
+        elif lang in ("zh-tw", "zh-hk", "chinese-traditional"):
             return ("china-t", None)
-        else:
+
+        # 유럽 언어 (라틴 알파벳)
+        elif lang in ("en", "eng", "english", "de", "fr", "es", "it", "pt", "nl", "pl", "ru"):
             return ("helv", None)
+
+        # 기타 - CJK 폰트가 가장 범용적
+        else:
+            return ("china-s", None)
 
     def get_font_for_pil(self, language: str, size: int = 12) -> 'ImageFont.FreeTypeFont':
         """
