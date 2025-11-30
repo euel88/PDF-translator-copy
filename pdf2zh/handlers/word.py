@@ -274,10 +274,141 @@ class WordHandler(BaseDocumentHandler):
         except Exception:
             pass
 
+        # 8. 주석(Comments) 수집
+        stats['comment'] = 0
+        try:
+            if hasattr(doc, 'part') and doc.part is not None:
+                comments_part = None
+                for rel in doc.part.rels.values():
+                    if 'comments' in rel.reltype:
+                        comments_part = rel.target_part
+                        break
+
+                if comments_part is not None:
+                    comments_xml = comments_part.element
+                    for cmt_idx, comment in enumerate(comments_xml.findall(qn('w:comment'))):
+                        for para_idx, para_elem in enumerate(comment.findall(qn('w:p'))):
+                            text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
+                            if text.strip():
+                                units.append(TextUnit(
+                                    location_type='comment',
+                                    location_ids=(cmt_idx, para_idx),
+                                    runs_info=[RunInfo(text=text)],
+                                    full_text=text
+                                ))
+                                stats['comment'] += 1
+        except Exception:
+            pass
+
+        # 9. 도형(Shape) 내 대체 텍스트 수집
+        stats['shape'] = 0
+        try:
+            # DrawingML 네임스페이스
+            wp_ns = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+            a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+            body = doc.element.body
+            # 모든 drawing 요소에서 텍스트 추출
+            for shape_idx, drawing in enumerate(body.iter('{%s}drawing' % (
+                'http://schemas.openxmlformats.org/wordprocessingml/2006/main'))):
+                # 도형 내 텍스트 바디 찾기
+                for txBody in drawing.iter('{%s}txBody' % a_ns):
+                    for para_idx, para_elem in enumerate(txBody.findall('{%s}p' % a_ns)):
+                        texts = []
+                        for t_elem in para_elem.iter('{%s}t' % a_ns):
+                            if t_elem.text:
+                                texts.append(t_elem.text)
+                        text = ''.join(texts)
+                        if text.strip():
+                            units.append(TextUnit(
+                                location_type='shape',
+                                location_ids=(shape_idx, para_idx),
+                                runs_info=[RunInfo(text=text)],
+                                full_text=text
+                            ))
+                            stats['shape'] += 1
+        except Exception:
+            pass
+
+        # 10. SmartArt 텍스트 수집
+        stats['smartart'] = 0
+        try:
+            dgm_ns = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+            a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+            body = doc.element.body
+            for smart_idx, dgm in enumerate(body.iter('{%s}relIds' % dgm_ns)):
+                # SmartArt 데이터에서 텍스트 추출
+                parent = dgm.getparent()
+                if parent is not None:
+                    for txBody in parent.iter('{%s}txBody' % a_ns):
+                        for para_idx, para_elem in enumerate(txBody.findall('{%s}p' % a_ns)):
+                            texts = []
+                            for t_elem in para_elem.iter('{%s}t' % a_ns):
+                                if t_elem.text:
+                                    texts.append(t_elem.text)
+                            text = ''.join(texts)
+                            if text.strip():
+                                units.append(TextUnit(
+                                    location_type='smartart',
+                                    location_ids=(smart_idx, para_idx),
+                                    runs_info=[RunInfo(text=text)],
+                                    full_text=text
+                                ))
+                                stats['smartart'] += 1
+        except Exception:
+            pass
+
+        # 11. 하이퍼링크 텍스트 수집 (별도 run에 있는 경우)
+        stats['hyperlink'] = 0
+        try:
+            body = doc.element.body
+            for hl_idx, hyperlink in enumerate(body.iter(qn('w:hyperlink'))):
+                # 하이퍼링크 내 텍스트 추출
+                text = ''.join(t.text or '' for t in hyperlink.iter(qn('w:t')))
+                if text.strip():
+                    # 본문 단락에서 이미 수집된 텍스트인지 확인
+                    already_collected = any(
+                        u.full_text == text and u.location_type == 'paragraph'
+                        for u in units
+                    )
+                    if not already_collected:
+                        units.append(TextUnit(
+                            location_type='hyperlink',
+                            location_ids=(hl_idx, 0),
+                            runs_info=[RunInfo(text=text)],
+                            full_text=text
+                        ))
+                        stats['hyperlink'] += 1
+        except Exception:
+            pass
+
+        # 12. 목차(Table of Contents) 필드 수집
+        stats['toc'] = 0
+        try:
+            body = doc.element.body
+            for fld_idx, fld_simple in enumerate(body.iter(qn('w:fldSimple'))):
+                instr = fld_simple.get(qn('w:instr'))
+                if instr and 'TOC' in instr.upper():
+                    text = ''.join(t.text or '' for t in fld_simple.iter(qn('w:t')))
+                    if text.strip():
+                        units.append(TextUnit(
+                            location_type='toc',
+                            location_ids=(fld_idx, 0),
+                            runs_info=[RunInfo(text=text)],
+                            full_text=text
+                        ))
+                        stats['toc'] += 1
+        except Exception:
+            pass
+
         # 수집 통계 로깅
-        self.log(f"텍스트 수집 완료: 본문 {stats['paragraph']}, 표 {stats['table']}, "
+        total = sum(stats.values())
+        self.log(f"텍스트 수집 완료 (총 {total}개): 본문 {stats['paragraph']}, 표 {stats['table']}, "
                  f"헤더 {stats['header']}, 푸터 {stats['footer']}, SDT {stats['sdt']}, "
-                 f"텍스트박스 {stats['textbox']}, 각주 {stats['footnote']}, 미주 {stats['endnote']}")
+                 f"텍스트박스 {stats['textbox']}, 각주 {stats['footnote']}, 미주 {stats['endnote']}, "
+                 f"주석 {stats['comment']}, 도형 {stats['shape']}, SmartArt {stats['smartart']}, "
+                 f"하이퍼링크 {stats['hyperlink']}, 목차 {stats['toc']}")
 
         return units
 
@@ -525,10 +656,92 @@ class WordHandler(BaseDocumentHandler):
                             self._replace_paragraph_text_xml(paras[para_idx], translated)
                             return True
 
+            elif element_type == 'comment':
+                cmt_idx, para_idx = location_ids
+                for rel in doc.part.rels.values():
+                    if 'comments' in rel.reltype:
+                        comments_xml = rel.target_part.element
+                        comments = list(comments_xml.findall(qn('w:comment')))
+                        if cmt_idx < len(comments):
+                            paras = list(comments[cmt_idx].findall(qn('w:p')))
+                            if para_idx < len(paras):
+                                self._replace_paragraph_text_xml(paras[para_idx], translated)
+                                return True
+
+            elif element_type == 'shape':
+                shape_idx, para_idx = location_ids
+                a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                body = doc.element.body
+                drawings = list(body.iter('{%s}drawing' % (
+                    'http://schemas.openxmlformats.org/wordprocessingml/2006/main')))
+                if shape_idx < len(drawings):
+                    txBodies = list(drawings[shape_idx].iter('{%s}txBody' % a_ns))
+                    if txBodies:
+                        paras = list(txBodies[0].findall('{%s}p' % a_ns))
+                        if para_idx < len(paras):
+                            self._replace_drawingml_text(paras[para_idx], translated, a_ns)
+                            return True
+
+            elif element_type == 'smartart':
+                smart_idx, para_idx = location_ids
+                dgm_ns = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+                a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                body = doc.element.body
+                dgm_elements = list(body.iter('{%s}relIds' % dgm_ns))
+                if smart_idx < len(dgm_elements):
+                    parent = dgm_elements[smart_idx].getparent()
+                    if parent is not None:
+                        txBodies = list(parent.iter('{%s}txBody' % a_ns))
+                        if txBodies:
+                            paras = list(txBodies[0].findall('{%s}p' % a_ns))
+                            if para_idx < len(paras):
+                                self._replace_drawingml_text(paras[para_idx], translated, a_ns)
+                                return True
+
+            elif element_type == 'hyperlink':
+                hl_idx, para_idx = location_ids
+                body = doc.element.body
+                hyperlinks = list(body.iter(qn('w:hyperlink')))
+                if hl_idx < len(hyperlinks):
+                    paras = list(hyperlinks[hl_idx].iter(qn('w:r')))
+                    for r_elem in paras:
+                        text_elements = list(r_elem.iter(qn('w:t')))
+                        if text_elements:
+                            text_elements[0].text = translated
+                            for t_elem in text_elements[1:]:
+                                t_elem.text = ""
+                            return True
+
+            elif element_type == 'toc':
+                fld_idx, _ = location_ids
+                body = doc.element.body
+                fld_simples = list(body.iter(qn('w:fldSimple')))
+                if fld_idx < len(fld_simples):
+                    text_elements = list(fld_simples[fld_idx].iter(qn('w:t')))
+                    if text_elements:
+                        text_elements[0].text = translated
+                        for t_elem in text_elements[1:]:
+                            t_elem.text = ""
+                        return True
+
         except Exception as e:
             self.log(f"XML 번역 적용 실패 ({element_type}): {e}")
 
         return False
+
+    def _replace_drawingml_text(self, para_elem, new_text: str, a_ns: str):
+        """DrawingML 단락의 텍스트 교체 (도형, SmartArt용)"""
+        # 기존 텍스트 요소 찾기
+        text_elements = list(para_elem.iter('{%s}t' % a_ns))
+        if not text_elements:
+            return
+
+        # 첫 번째 텍스트 요소에 전체 번역 텍스트 설정
+        text_elements[0].text = new_text
+
+        # 나머지 텍스트 요소는 비우기
+        for t_elem in text_elements[1:]:
+            t_elem.text = ""
 
     def _replace_paragraph_text_xml(self, para_elem, new_text: str):
         """XML 단락의 텍스트 교체"""
@@ -584,7 +797,8 @@ class WordHandler(BaseDocumentHandler):
                     section_idx, para_idx = unit.location_ids
                     return doc.sections[section_idx].footer.paragraphs[para_idx]
 
-            elif unit.location_type in ('footnote', 'endnote', 'textbox', 'sdt'):
+            elif unit.location_type in ('footnote', 'endnote', 'textbox', 'sdt',
+                                        'comment', 'shape', 'smartart', 'hyperlink', 'toc'):
                 # XML 기반 요소는 특별 처리 필요
                 return ('xml_element', unit.location_type, unit.location_ids)
 
