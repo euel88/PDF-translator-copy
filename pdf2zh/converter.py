@@ -318,6 +318,11 @@ class PDFConverter:
         output_quality: int = 85,  # JPEG 품질 (1-100)
         use_vector_text: bool = True,  # 벡터 텍스트 사용 (파일 크기 대폭 감소)
         compress_images: bool = True,  # 이미지 압축 사용
+        # 이중 언어 출력
+        dual_output: bool = False,  # 이중 언어 PDF 생성
+        # 정규표현식 예외 처리
+        exclude_patterns: Optional[List[str]] = None,  # 번역 제외 패턴
+        include_patterns: Optional[List[str]] = None,  # 번역 포함 패턴
     ):
         self.translator = translator
         self.dpi = dpi
@@ -333,6 +338,26 @@ class PDFConverter:
         self.use_vector_text = use_vector_text
         self.compress_images = compress_images
 
+        # 이중 언어 출력
+        self.dual_output = dual_output
+
+        # 정규표현식 예외 처리 (컴파일된 패턴 저장)
+        self.exclude_patterns = []
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                try:
+                    self.exclude_patterns.append(re.compile(pattern))
+                except re.error:
+                    pass  # 잘못된 패턴 무시
+
+        self.include_patterns = []
+        if include_patterns:
+            for pattern in include_patterns:
+                try:
+                    self.include_patterns.append(re.compile(pattern))
+                except re.error:
+                    pass  # 잘못된 패턴 무시
+
         # 언어별 줄간격
         self.line_height = LANG_LINEHEIGHT_MAP.get(target_lang.lower(), 1.2)
 
@@ -344,6 +369,31 @@ class PDFConverter:
 
         # OCR 엔진
         self.ocr_engine = TesseractOCR(source_lang) if use_ocr else None
+
+    def _should_translate(self, text: str) -> bool:
+        """
+        텍스트를 번역해야 하는지 확인 (정규표현식 필터링)
+
+        Args:
+            text: 확인할 텍스트
+
+        Returns:
+            번역해야 하면 True, 제외해야 하면 False
+        """
+        # include_patterns가 있으면 해당 패턴에 매칭되는 것만 번역
+        if self.include_patterns:
+            for pattern in self.include_patterns:
+                if pattern.search(text):
+                    return True
+            return False  # 어떤 패턴에도 매칭 안 되면 번역 안 함
+
+        # exclude_patterns에 매칭되면 번역 제외
+        if self.exclude_patterns:
+            for pattern in self.exclude_patterns:
+                if pattern.search(text):
+                    return False
+
+        return True  # 기본적으로 번역
 
     def _find_font_file(self) -> Optional[str]:
         """시스템에서 사용 가능한 폰트 파일 찾기 - Go Noto Universal 우선"""
@@ -403,8 +453,14 @@ class PDFConverter:
 
             self._log(f"총 {len(pages)} 페이지 처리")
 
+            dual_pdf = None
+
+            # 이중 언어 출력 모드
+            if self.dual_output:
+                self._log("이중 언어 모드 사용 (원문 + 번역)")
+                mono_pdf, dual_pdf = self._convert_dual_mode(doc, pages)
             # 벡터 텍스트 모드: 원본 PDF를 직접 수정
-            if self.use_vector_text:
+            elif self.use_vector_text:
                 self._log("벡터 텍스트 모드 사용 (파일 크기 최적화)")
                 mono_pdf = self._convert_vector_mode(doc, pages)
             else:
@@ -412,15 +468,24 @@ class PDFConverter:
                 self._log("이미지 모드 사용")
                 mono_pdf = self._convert_image_mode(doc, pages)
 
+            # 출력 파일 저장
             if output_path:
                 with open(output_path, "wb") as f:
                     f.write(mono_pdf)
                 self._log(f"저장됨: {output_path}")
 
+                # 이중 언어 PDF도 저장 (있는 경우)
+                if dual_pdf:
+                    dual_path = output_path.replace('.pdf', '-dual.pdf')
+                    with open(dual_path, "wb") as f:
+                        f.write(dual_pdf)
+                    self._log(f"이중 언어 저장됨: {dual_path}")
+
             doc.close()
 
             return TranslateResult(
                 mono_pdf=mono_pdf,
+                dual_pdf=dual_pdf,
                 output_path=output_path,
                 page_count=len(pages),
                 success=True,
@@ -463,8 +528,17 @@ class PDFConverter:
             if not blocks:
                 continue
 
-            # 번역할 블록 필터링 (수식 제외)
-            to_translate = [b for b in blocks if not b.is_formula]
+            # 번역할 블록 필터링 (수식 제외 + 정규표현식 필터)
+            to_translate = []
+            skip_indices = set()
+
+            for i, b in enumerate(blocks):
+                if b.is_formula:
+                    skip_indices.add(i)
+                elif not self._should_translate(b.text):
+                    skip_indices.add(i)
+                else:
+                    to_translate.append(b)
 
             if not to_translate:
                 continue
@@ -1453,3 +1527,103 @@ class PDFConverter:
         doc.close()
 
         return output.getvalue()
+
+    def _convert_dual_mode(
+        self,
+        doc: fitz.Document,
+        pages: List[int]
+    ) -> Tuple[bytes, bytes]:
+        """
+        이중 언어 모드 변환 - 원문과 번역을 동시에 표시
+
+        PDFMathTranslate의 dual mode 구현:
+        - mono_pdf: 번역만 있는 PDF
+        - dual_pdf: 원문 페이지 + 번역 페이지 번갈아 표시
+
+        Returns:
+            Tuple[bytes, bytes]: (mono_pdf, dual_pdf)
+        """
+        # 먼저 mono PDF 생성 (벡터 모드 사용)
+        mono_doc = fitz.open()
+        dual_doc = fitz.open()
+
+        for idx, page_num in enumerate(pages):
+            if self._cancelled:
+                break
+
+            self._log(f"페이지 {page_num + 1}/{doc.page_count} 처리 중 (이중 언어)...")
+
+            # 원본 페이지
+            page = doc[page_num]
+
+            # dual PDF: 먼저 원본 페이지 추가
+            dual_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+
+            # 번역 페이지 생성
+            mono_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            new_page_mono = mono_doc[-1]
+
+            # dual PDF에도 번역 페이지 복사 추가
+            dual_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            new_page_dual = dual_doc[-1]
+
+            # 배경색 감지를 위한 페이지 렌더링
+            page_pixmap = page.get_pixmap(matrix=fitz.Matrix(1, 1))
+
+            # 텍스트 블록 추출
+            blocks = self._extract_blocks_for_vector(page)
+
+            if not blocks:
+                continue
+
+            # 번역할 블록 필터링 (수식 제외 + 정규표현식 필터)
+            to_translate = []
+            for b in blocks:
+                if not b.is_formula and self._should_translate(b.text):
+                    to_translate.append(b)
+
+            if not to_translate:
+                continue
+
+            # 배치 번역
+            texts = []
+            formulas_map = {}
+
+            for i, block in enumerate(to_translate):
+                text, formulas = FormulaDetector.extract_formulas(block.text)
+                texts.append(text)
+                formulas_map[i] = formulas
+
+            self._log(f"  번역 중... ({len(texts)}개 블록)")
+            translations = self.translator.translate_batch(texts)
+
+            # 수식 복원
+            for i, trans in enumerate(translations):
+                if i in formulas_map and formulas_map[i]:
+                    translations[i] = FormulaDetector.restore_formulas(trans, formulas_map[i])
+
+            # mono PDF와 dual PDF의 번역 페이지에 번역 적용
+            self._replace_text_vector(new_page_mono, to_translate, translations, page_pixmap)
+            self._replace_text_vector(new_page_dual, to_translate, translations, page_pixmap)
+
+        # mono PDF 저장
+        mono_output = io.BytesIO()
+        mono_doc.save(
+            mono_output,
+            garbage=4,
+            deflate=True,
+            clean=True,
+        )
+        mono_doc.close()
+
+        # dual PDF 저장
+        dual_output = io.BytesIO()
+        dual_doc.save(
+            dual_output,
+            garbage=4,
+            deflate=True,
+            clean=True,
+        )
+        dual_doc.close()
+
+        return mono_output.getvalue(), dual_output.getvalue()

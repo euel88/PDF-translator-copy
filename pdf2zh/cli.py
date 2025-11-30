@@ -25,11 +25,21 @@ def create_parser() -> argparse.ArgumentParser:
   # 기본 번역 (영어 -> 한국어, OpenAI)
   pdf2zh input.pdf
 
+  # URL 직접 번역 (arxiv 등)
+  pdf2zh https://arxiv.org/pdf/2301.00001.pdf
+  pdf2zh https://arxiv.org/abs/2301.00001
+
   # 특정 서비스와 언어 지정
   pdf2zh input.pdf -s google --from en --to ko
 
   # 페이지 범위 지정
   pdf2zh input.pdf -p 1-10,15,20-25
+
+  # 이중 언어 PDF 생성 (원문 + 번역)
+  pdf2zh input.pdf --dual
+
+  # 정규표현식으로 특정 패턴 제외
+  pdf2zh input.pdf -x "Figure\\s*\\d+" -x "Table\\s*\\d+"
 
   # 멀티스레드 사용
   pdf2zh input.pdf -t 4
@@ -58,7 +68,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input",
         nargs="?",
-        help="입력 PDF 파일 경로"
+        help="입력 PDF 파일 경로 또는 URL (http://, https://)"
     )
 
     # 기본 옵션
@@ -164,6 +174,30 @@ def create_parser() -> argparse.ArgumentParser:
         help="이미지 모드 사용 (벡터 모드 대신)"
     )
 
+    # 이중 언어 출력 (PDFMathTranslate dual mode)
+    parser.add_argument(
+        "--dual",
+        action="store_true",
+        help="이중 언어 PDF 생성 (원문 + 번역)"
+    )
+
+    # 정규표현식 예외 처리 (PDFMathTranslate -f, -c 옵션)
+    parser.add_argument(
+        "-x", "--exclude",
+        dest="exclude_patterns",
+        action="append",
+        default=[],
+        help="번역 제외 패턴 (정규표현식, 여러 번 사용 가능)"
+    )
+
+    parser.add_argument(
+        "-c", "--include",
+        dest="include_patterns",
+        action="append",
+        default=[],
+        help="번역 포함 패턴 (정규표현식, 지정 시 이 패턴만 번역)"
+    )
+
     # 레이아웃 옵션
     parser.add_argument(
         "--use-layout",
@@ -265,12 +299,20 @@ def parse_pages(pages_str: str) -> List[int]:
 
 
 def translate_file(args) -> bool:
-    """단일 파일 번역"""
-    from pdf2zh.high_level import translate
+    """단일 파일 번역 (파일 경로 또는 URL 지원)"""
+    from pdf2zh.high_level import translate, is_url
 
     # 출력 경로 결정
     if args.output:
         output_path = args.output
+    elif is_url(args.input):
+        # URL인 경우 현재 디렉토리에 저장
+        url_path = args.input.split('?')[0]
+        filename = url_path.split('/')[-1]
+        if not filename.endswith('.pdf'):
+            filename = 'downloaded.pdf'
+        stem = filename.rsplit('.', 1)[0]
+        output_path = f"{stem}_translated.pdf"
     else:
         input_path = Path(args.input)
         output_path = str(input_path.parent / f"{input_path.stem}_translated{input_path.suffix}")
@@ -302,6 +344,10 @@ def translate_file(args) -> bool:
     def progress_callback(msg: str):
         if args.verbose:
             print(msg)
+        else:
+            # 중요 메시지만 출력
+            if any(key in msg for key in ['다운로드', '오류', '저장됨', 'URL']):
+                print(msg)
 
     # 번역 실행
     result = translate(
@@ -316,12 +362,19 @@ def translate_file(args) -> bool:
         use_vector_text=not args.image_mode,
         compress_images=not args.no_compress,
         callback=progress_callback,
+        # 새 옵션들
+        dual_output=args.dual if hasattr(args, 'dual') else False,
+        exclude_patterns=args.exclude_patterns if args.exclude_patterns else None,
+        include_patterns=args.include_patterns if args.include_patterns else None,
         **translator_kwargs,
     )
 
     if result.success:
         print(f"번역 완료: {result.output_path}")
         print(f"페이지 수: {result.page_count}")
+        if result.dual_pdf:
+            dual_path = result.output_path.replace('.pdf', '-dual.pdf')
+            print(f"이중 언어: {dual_path}")
         return True
     else:
         print(f"번역 실패: {result.error}")
@@ -487,7 +540,9 @@ def main():
         return 0 if translate_directory(args) else 1
 
     if args.input:
-        if not os.path.exists(args.input):
+        # URL인 경우 파일 존재 검사 건너뛰기
+        is_url = args.input.startswith(('http://', 'https://'))
+        if not is_url and not os.path.exists(args.input):
             print(f"파일을 찾을 수 없습니다: {args.input}")
             return 1
         return 0 if translate_file(args) else 1
