@@ -657,6 +657,10 @@ class PDFConverter:
 
         self._log(f"  {len(pages)}페이지 처리 완료")
 
+        # 주석 및 폼 필드 번역
+        self._log("주석 및 폼 필드 번역 중...")
+        self._translate_annotations_and_forms(output_doc)
+
         # 압축 옵션으로 저장
         self._log("4단계: PDF 저장 중...")
         output = io.BytesIO()
@@ -1109,9 +1113,13 @@ class PDFConverter:
 
         # PDF 생성 (압축 옵션 적용)
         self._log("4단계: PDF 생성 중...")
-        result = self._create_pdf(translated_images)
+        result_pdf = self._create_pdf(translated_images)
+
+        # 이미지 모드에서는 주석이 제거되므로 별도 처리 불필요
+        # (원본 PDF 구조가 유지되지 않음)
+
         self._log("  생성 완료")
-        return result
+        return result_pdf
 
     def _render_page(self, page: fitz.Page) -> Image.Image:
         """페이지 렌더링"""
@@ -1794,6 +1802,189 @@ class PDFConverter:
 
         return output.getvalue()
 
+    def _translate_annotations_and_forms(self, doc: fitz.Document):
+        """
+        PDF 주석 및 폼 필드 텍스트 번역
+
+        지원되는 주석 유형:
+        - 텍스트 주석 (노트, 팝업)
+        - FreeText 주석 (자유 텍스트)
+        - 하이라이트, 밑줄, 취소선 주석의 레이블
+        - 스탬프 주석
+        - 링크 주석의 표시 텍스트
+
+        지원되는 폼 필드:
+        - 텍스트 필드
+        - 콤보 박스 옵션
+        - 리스트 박스 옵션
+        - 버튼 레이블
+        """
+        # 모든 주석 및 폼 필드 텍스트 수집
+        annotations_data = []  # [(page_num, annot_index, text_type, original_text)]
+        forms_data = []  # [(field_name, text_type, original_text)]
+
+        # 1. 주석 수집
+        for page_num in range(doc.page_count):
+            page = doc[page_num]
+            annots = page.annots()
+            if not annots:
+                continue
+
+            for annot_idx, annot in enumerate(annots):
+                try:
+                    annot_type = annot.type[0]  # 주석 유형 번호
+
+                    # 텍스트 주석 (노트)
+                    if annot_type == 0:  # Text annotation
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                    # FreeText 주석
+                    elif annot_type == 2:  # FreeText
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                    # 하이라이트, 밑줄, 취소선 주석
+                    elif annot_type in (8, 9, 10, 11):  # Highlight, Underline, Squiggly, StrikeOut
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                    # 스탬프 주석
+                    elif annot_type == 13:  # Stamp
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                    # 팝업 주석
+                    elif annot_type == 16:  # Popup
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                    # 링크 주석의 제목
+                    elif annot_type == 3:  # Link
+                        title = annot.info.get("title", "")
+                        if title and title.strip():
+                            annotations_data.append((page_num, annot_idx, "title", title))
+
+                    # 파일 첨부 주석
+                    elif annot_type == 17:  # FileAttachment
+                        content = annot.info.get("content", "")
+                        if content and content.strip():
+                            annotations_data.append((page_num, annot_idx, "content", content))
+
+                except Exception:
+                    pass
+
+        # 2. 폼 필드 수집 (Widget 주석)
+        try:
+            for page_num in range(doc.page_count):
+                page = doc[page_num]
+                widgets = page.widgets()
+                if not widgets:
+                    continue
+
+                for widget in widgets:
+                    try:
+                        field_type = widget.field_type
+                        field_name = widget.field_name or f"field_{page_num}_{widget.xref}"
+
+                        # 텍스트 필드
+                        if field_type == 1:  # Text field
+                            value = widget.field_value
+                            if value and value.strip() and self._should_translate(value):
+                                forms_data.append((field_name, page_num, widget.xref, "value", value))
+
+                            # 툴팁/설명
+                            tip = widget.field_label
+                            if tip and tip.strip():
+                                forms_data.append((field_name, page_num, widget.xref, "label", tip))
+
+                        # 버튼 (체크박스, 라디오버튼, 푸시버튼)
+                        elif field_type == 2:  # Button
+                            label = widget.button_caption
+                            if label and label.strip():
+                                forms_data.append((field_name, page_num, widget.xref, "caption", label))
+
+                        # 콤보박스/리스트박스
+                        elif field_type in (3, 4):  # Choice (combo/list)
+                            # 현재 값
+                            value = widget.field_value
+                            if value and value.strip() and self._should_translate(value):
+                                forms_data.append((field_name, page_num, widget.xref, "value", value))
+
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 번역할 텍스트가 없으면 종료
+        if not annotations_data and not forms_data:
+            return
+
+        # 3. 텍스트 수집
+        all_texts = []
+        for data in annotations_data:
+            all_texts.append(data[3])  # original_text
+        for data in forms_data:
+            all_texts.append(data[4])  # original_text
+
+        if not all_texts:
+            return
+
+        self._log(f"  주석 {len(annotations_data)}개, 폼 필드 {len(forms_data)}개 번역 중...")
+
+        # 4. 일괄 번역
+        try:
+            translations = self.translator.translate_batch(all_texts)
+        except Exception as e:
+            self._log(f"  주석/폼 필드 번역 실패: {e}")
+            return
+
+        # 5. 번역 결과 적용
+        trans_idx = 0
+
+        # 주석에 적용
+        for page_num, annot_idx, text_type, original in annotations_data:
+            try:
+                page = doc[page_num]
+                annots = list(page.annots())
+                if annot_idx < len(annots):
+                    annot = annots[annot_idx]
+                    translated = translations[trans_idx]
+
+                    if text_type == "content":
+                        annot.set_info(content=translated)
+                    elif text_type == "title":
+                        annot.set_info(title=translated)
+
+                    annot.update()
+            except Exception:
+                pass
+            trans_idx += 1
+
+        # 폼 필드에 적용
+        for field_name, page_num, xref, text_type, original in forms_data:
+            try:
+                page = doc[page_num]
+                translated = translations[trans_idx]
+
+                # xref로 위젯 찾기
+                for widget in page.widgets():
+                    if widget.xref == xref:
+                        if text_type == "value":
+                            widget.field_value = translated
+                        elif text_type == "caption":
+                            widget.button_caption = translated
+                        widget.update()
+                        break
+            except Exception:
+                pass
+            trans_idx += 1
+
     def _convert_dual_mode(
         self,
         doc: fitz.Document,
@@ -1871,6 +2062,11 @@ class PDFConverter:
             # mono PDF와 dual PDF의 번역 페이지에 번역 적용
             self._replace_text_vector(new_page_mono, to_translate, translations, page_pixmap)
             self._replace_text_vector(new_page_dual, to_translate, translations, page_pixmap)
+
+        # 주석 및 폼 필드 번역
+        self._log("주석 및 폼 필드 번역 중...")
+        self._translate_annotations_and_forms(mono_doc)
+        self._translate_annotations_and_forms(dual_doc)
 
         # mono PDF 저장
         mono_output = io.BytesIO()
