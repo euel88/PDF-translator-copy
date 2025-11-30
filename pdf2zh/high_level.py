@@ -114,6 +114,8 @@ def translate(
     # 정규표현식 예외 처리
     exclude_patterns: Optional[List[str]] = None,  # 번역 제외 패턴 (정규표현식)
     include_patterns: Optional[List[str]] = None,  # 번역 포함 패턴 (정규표현식)
+    # OCR 옵션
+    use_ocr: bool = False,  # OCR 사용 (스캔된 PDF/이미지 기반 PDF용)
     **kwargs
 ) -> TranslateResult:
     """
@@ -134,6 +136,7 @@ def translate(
         dual_output: 이중 언어 PDF 생성 여부 (원문 + 번역)
         exclude_patterns: 번역에서 제외할 정규표현식 패턴 목록
         include_patterns: 번역에 포함할 정규표현식 패턴 목록 (지정 시 이 패턴만 번역)
+        use_ocr: OCR 사용 여부 (스캔된 PDF 또는 이미지 기반 PDF에 필요)
         **kwargs: 번역기 추가 옵션
 
     Returns:
@@ -190,6 +193,7 @@ def translate(
             result = _translate_pdf(
                 actual_path, output_path, translator,
                 pages, dpi, callback,
+                source_lang=src_code,
                 target_lang=tgt_code,
                 output_quality=output_quality,
                 use_vector_text=use_vector_text,
@@ -197,6 +201,7 @@ def translate(
                 dual_output=dual_output,
                 exclude_patterns=exclude_patterns,
                 include_patterns=include_patterns,
+                use_ocr=use_ocr,
             )
         else:
             result = _translate_document(
@@ -222,6 +227,7 @@ def _translate_pdf(
     pages: Optional[List[int]],
     dpi: int,
     callback: Optional[Callable[[str], None]],
+    source_lang: str = "eng",
     target_lang: str = "ko",
     output_quality: int = 85,
     use_vector_text: bool = True,
@@ -229,6 +235,7 @@ def _translate_pdf(
     dual_output: bool = False,
     exclude_patterns: Optional[List[str]] = None,
     include_patterns: Optional[List[str]] = None,
+    use_ocr: bool = False,
 ) -> TranslateResult:
     """PDF 번역"""
     # 출력 경로 자동 생성
@@ -241,6 +248,7 @@ def _translate_pdf(
         translator=translator,
         dpi=dpi,
         callback=callback,
+        source_lang=source_lang,
         target_lang=target_lang,
         output_quality=output_quality,
         use_vector_text=use_vector_text,
@@ -248,6 +256,7 @@ def _translate_pdf(
         dual_output=dual_output,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
+        use_ocr=use_ocr,
     )
 
     return converter.convert(

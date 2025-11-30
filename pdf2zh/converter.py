@@ -592,12 +592,19 @@ class PDFConverter:
         all_texts = []  # 전체 번역할 텍스트
         all_formulas = []  # 전체 수식 맵
 
+        ocr_used = False
         for page_num in pages:
             if self._cancelled:
                 break
 
             page = doc[page_num]
-            blocks = self._extract_blocks_for_vector(page)
+            blocks, has_text = self._extract_blocks_for_vector(page)
+
+            # OCR 폴백: 텍스트가 없는 스캔된 PDF
+            if not has_text and self.ocr_engine:
+                self._log(f"  페이지 {page_num + 1}: 텍스트 없음 → OCR 사용")
+                blocks = self._extract_blocks_for_vector_ocr(page)
+                ocr_used = True
 
             # 번역할 블록 필터링
             to_translate_indices = []
@@ -613,7 +620,8 @@ class PDFConverter:
 
         total_texts = len(all_texts)
         extract_elapsed = time.time() - extract_start_time
-        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료 ({extract_elapsed:.1f}초)")
+        ocr_msg = " (OCR 사용됨)" if ocr_used else ""
+        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료 ({extract_elapsed:.1f}초){ocr_msg}")
 
         # ===== 2단계: 전체 텍스트 일괄 번역 =====
         translate_start_time = time.time()
@@ -694,9 +702,14 @@ class PDFConverter:
 
         return output.getvalue()
 
-    def _extract_blocks_for_vector(self, page: fitz.Page) -> List[TextBlock]:
-        """벡터 모드용 텍스트 블록 추출 (스케일 없음)"""
+    def _extract_blocks_for_vector(self, page: fitz.Page) -> Tuple[List[TextBlock], bool]:
+        """벡터 모드용 텍스트 블록 추출 (스케일 없음)
+
+        Returns:
+            Tuple[List[TextBlock], bool]: (블록 리스트, 텍스트 발견 여부)
+        """
         blocks = []
+        has_text = False
 
         page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
 
@@ -713,6 +726,7 @@ class PDFConverter:
                     if text:
                         line_text += text + " "
                         line_spans.append(span)
+                        has_text = True
 
                 line_text = line_text.strip()
                 if not line_text or len(line_text) < 2:
@@ -779,6 +793,58 @@ class PDFConverter:
                     is_formula=is_formula,
                     is_vertical=is_vertical,
                 ))
+
+        return blocks, has_text
+
+    def _extract_blocks_for_vector_ocr(
+        self,
+        page: fitz.Page,
+        img: Optional[Image.Image] = None
+    ) -> List[TextBlock]:
+        """OCR을 사용하여 벡터 모드용 텍스트 블록 추출 (스캔된 PDF용)
+
+        Args:
+            page: PDF 페이지
+            img: 렌더링된 이미지 (없으면 새로 생성)
+
+        Returns:
+            List[TextBlock]: OCR로 추출된 텍스트 블록
+        """
+        if not self.ocr_engine:
+            self._log("  OCR 엔진이 활성화되지 않음. use_ocr=True로 설정하세요.")
+            return []
+
+        blocks = []
+
+        # 이미지가 없으면 페이지 렌더링
+        if img is None:
+            # 벡터 모드에서는 스케일 없이 원본 좌표 사용
+            pix = page.get_pixmap(matrix=fitz.Matrix(1, 1))
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+        # OCR 실행
+        self._log(f"  OCR 텍스트 인식 중...")
+        ocr_results = self.ocr_engine.recognize(img)
+        merged = merge_ocr_results(ocr_results)
+
+        self._log(f"  OCR: {len(merged)}개 텍스트 영역 감지")
+
+        for result in merged:
+            if len(result.text) < 2:
+                continue
+
+            # OCR 결과에서 수식 감지
+            is_formula = FormulaDetector.is_formula(result.text)
+
+            blocks.append(TextBlock(
+                text=result.text,
+                bbox=result.bbox,
+                font_size=14,  # OCR은 폰트 정보 없음, 기본값 사용
+                font_name="",
+                color=(0, 0, 0),  # 기본 검정색
+                is_formula=is_formula,
+                is_vertical=False,
+            ))
 
         return blocks
 

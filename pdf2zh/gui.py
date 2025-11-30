@@ -63,6 +63,8 @@ class TranslatorThread(threading.Thread):
                 use_vector_text=self.params.get("use_vector_text", True),
                 compress_images=self.params.get("compress_images", True),
                 output_quality=self.params.get("output_quality", 85),
+                # OCR 옵션
+                use_ocr=self.params.get("use_ocr", False),
                 **self.params.get("kwargs", {})
             )
 
@@ -255,6 +257,15 @@ class MainWindow(QMainWindow):
         quality_layout.addStretch()
         opt_layout.addRow("이미지 품질:", quality_layout)
 
+        # OCR 사용
+        self.use_ocr = QCheckBox("OCR 사용 (스캔된 PDF)")
+        self.use_ocr.setChecked(False)
+        self.use_ocr.setToolTip(
+            "스캔된 PDF나 이미지 기반 PDF에서 텍스트를 인식합니다.\n"
+            "Tesseract OCR이 설치되어 있어야 합니다."
+        )
+        opt_layout.addRow("OCR:", self.use_ocr)
+
         layout.addWidget(opt_group)
 
         # 버튼
@@ -420,10 +431,12 @@ class MainWindow(QMainWindow):
         self.use_vector_text.setEnabled(is_pdf)
         self.compress_images.setEnabled(is_pdf)
         self.output_quality.setEnabled(is_pdf)
+        self.use_ocr.setEnabled(is_pdf)
 
         if not is_pdf:
             self.page_start.setValue(0)
             self.page_end.setValue(0)
+            self.use_ocr.setChecked(False)
 
     def _on_vector_mode_changed(self, state: int):
         """벡터 모드 변경 시 이미지 옵션 활성화/비활성화"""
@@ -485,6 +498,8 @@ class MainWindow(QMainWindow):
             "use_vector_text": self.use_vector_text.isChecked(),
             "compress_images": self.compress_images.isChecked(),
             "output_quality": self.output_quality.value(),
+            # OCR 옵션
+            "use_ocr": self.use_ocr.isChecked(),
             "kwargs": kwargs,
         }
 
