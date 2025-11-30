@@ -6,9 +6,11 @@ PDF 변환 모듈 - PDFMathTranslate 구조 기반
 - 다중 페이지 병렬 텍스트 추출
 - 전체 문서 일괄 번역 (API 호출 최소화)
 - 병렬 페이지 처리
+- 번역 소요 시간 표시
 """
 import io
 import re
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Any
@@ -578,7 +580,11 @@ class PDFConverter:
         2단계: 전체 텍스트 일괄 번역 (API 호출 최소화)
         3단계: 번역 결과 적용
         """
+        # 전체 시간 측정 시작
+        total_start_time = time.time()
+
         # ===== 1단계: 모든 페이지에서 텍스트 추출 =====
+        extract_start_time = time.time()
         self._log("1단계: 텍스트 추출 중...")
 
         # 페이지별 데이터 저장
@@ -606,9 +612,11 @@ class PDFConverter:
             page_data.append((page_num, blocks, to_translate_indices))
 
         total_texts = len(all_texts)
-        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료")
+        extract_elapsed = time.time() - extract_start_time
+        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료 ({extract_elapsed:.1f}초)")
 
         # ===== 2단계: 전체 텍스트 일괄 번역 =====
+        translate_start_time = time.time()
         if total_texts > 0:
             self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중...")
             all_translations = self.translator.translate_batch(all_texts)
@@ -618,11 +626,14 @@ class PDFConverter:
                 if all_formulas[i]:
                     all_translations[i] = FormulaDetector.restore_formulas(trans, all_formulas[i])
 
-            self._log("  번역 완료")
+            translate_elapsed = time.time() - translate_start_time
+            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {total_texts}개 항목)")
         else:
             all_translations = []
+            translate_elapsed = 0
 
         # ===== 3단계: 번역 결과 적용 =====
+        apply_start_time = time.time()
         self._log("3단계: 번역 결과 적용 중...")
         output_doc = fitz.open()
         translation_idx = 0
@@ -655,7 +666,8 @@ class PDFConverter:
             # 벡터 텍스트 교체
             self._replace_text_vector(new_page, page_blocks, page_translations, page_pixmap)
 
-        self._log(f"  {len(pages)}페이지 처리 완료")
+        apply_elapsed = time.time() - apply_start_time
+        self._log(f"  {len(pages)}페이지 처리 완료 ({apply_elapsed:.1f}초)")
 
         # 주석 및 폼 필드 번역
         self._log("주석 및 폼 필드 번역 중...")
@@ -671,7 +683,14 @@ class PDFConverter:
             clean=True,  # 사용하지 않는 객체 제거
         )
         output_doc.close()
-        self._log("  저장 완료")
+
+        # 전체 소요 시간 출력
+        total_elapsed = time.time() - total_start_time
+        self._log(f"  저장 완료")
+        self._log(f"===== 번역 완료: 총 {total_elapsed:.1f}초 소요 =====")
+        self._log(f"  - 텍스트 추출: {extract_elapsed:.1f}초")
+        self._log(f"  - 번역: {translate_elapsed:.1f}초 ({total_texts}개 항목)")
+        self._log(f"  - 결과 적용: {apply_elapsed:.1f}초")
 
         return output.getvalue()
 
@@ -770,7 +789,10 @@ class PDFConverter:
         translations: List[str],
         page_pixmap: Optional[fitz.Pixmap] = None
     ):
-        """벡터 방식으로 텍스트 교체 - PyMuPDF 사용, 원본 레이아웃 최대 보존"""
+        """벡터 방식으로 텍스트 교체 - PyMuPDF 사용, 원본 레이아웃 최대 보존
+
+        개선: 번역 결과가 비어있거나 실패할 경우 원본 텍스트 유지
+        """
 
         # 외부 폰트 등록 (한글 지원)
         font_registered = False
@@ -786,20 +808,21 @@ class PDFConverter:
                 pass
 
         for block, translation in zip(blocks, translations):
+            # 번역 결과 검증: 비어있거나 None인 경우 원본 유지 (텍스트를 덮지 않음)
+            if translation is None or not translation.strip():
+                continue  # 원본 텍스트 유지
+
             x0, y0, x1, y1 = block.bbox
             rect = fitz.Rect(x0, y0, x1, y1)
+
+            # 번역 결과 유효성 확인: 원본과 동일하면 처리 건너뜀
+            if translation.strip() == block.text.strip():
+                continue  # 변경 없음, 원본 유지
 
             # 배경색 감지 (페이지 렌더링에서)
             bg_color = self._detect_bg_color_from_pixmap(page_pixmap, rect) if page_pixmap else (1, 1, 1)
 
-            # 원본 텍스트 영역을 배경색으로 덮기
-            # 패딩을 최소화하여 주변 요소에 영향 줄이기
-            pad_x = 0.5  # 수평 패딩 최소화
-            pad_y = 0.5  # 수직 패딩 최소화
-            cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
-            page.draw_rect(cover_rect, color=None, fill=bg_color)
-
-            # 번역된 텍스트 삽입
+            # 폰트 설정
             font_size = block.font_size
             text_color = tuple(c / 255 for c in block.color)
 
@@ -814,8 +837,18 @@ class PDFConverter:
                 page, translation, rect, font_size, fontname
             )
 
-            # 텍스트 삽입 (줄간격 적용)
+            # 텍스트 삽입 시도
+            text_inserted = False
+
+            # 1차 시도: 등록된 폰트 사용
             try:
+                # 먼저 원본 텍스트 영역을 배경색으로 덮기
+                pad_x = 0.5  # 수평 패딩 최소화
+                pad_y = 0.5  # 수직 패딩 최소화
+                cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
+                page.draw_rect(cover_rect, color=None, fill=bg_color)
+
+                # 번역된 텍스트 삽입 (줄간격 적용)
                 page.insert_textbox(
                     rect,
                     fitted_text,
@@ -825,9 +858,19 @@ class PDFConverter:
                     align=fitz.TEXT_ALIGN_LEFT,
                     lineheight=self.line_height,
                 )
+                text_inserted = True
             except Exception:
-                # 폴백: 기본 폰트 사용
+                pass
+
+            # 2차 시도: 기본 폰트 (helv) 사용
+            if not text_inserted:
                 try:
+                    # 원본 영역 덮기 (아직 안 덮었으면)
+                    pad_x = 0.5
+                    pad_y = 0.5
+                    cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
+                    page.draw_rect(cover_rect, color=None, fill=bg_color)
+
                     page.insert_textbox(
                         rect,
                         fitted_text,
@@ -836,7 +879,23 @@ class PDFConverter:
                         color=text_color,
                         align=fitz.TEXT_ALIGN_LEFT,
                     )
+                    text_inserted = True
                 except Exception:
+                    pass
+
+            # 3차 시도: CJK 폰트로 원본 텍스트라도 복원 시도
+            if not text_inserted:
+                try:
+                    page.insert_textbox(
+                        rect,
+                        block.text,  # 원본 텍스트로 복원
+                        fontsize=font_size,
+                        fontname="china-s",  # CJK 폰트
+                        color=text_color,
+                        align=fitz.TEXT_ALIGN_LEFT,
+                    )
+                except Exception:
+                    # 최종 폴백 실패 - 원본 영역이 덮였을 수 있으나 복구 불가
                     pass
 
     def _detect_bg_color_from_pixmap(
@@ -1032,9 +1091,13 @@ class PDFConverter:
         """
         이미지 모드 변환 - 기존 방식 (호환성용)
 
-        개선: 일괄 번역으로 속도 향상
+        개선: 일괄 번역으로 속도 향상, 소요 시간 표시
         """
+        # 전체 시간 측정 시작
+        total_start_time = time.time()
+
         # ===== 1단계: 모든 페이지 렌더링 및 텍스트 추출 =====
+        extract_start_time = time.time()
         self._log("1단계: 페이지 렌더링 및 텍스트 추출 중...")
 
         page_data = []  # [(img, blocks, to_translate_indices)]
@@ -1068,9 +1131,11 @@ class PDFConverter:
             page_data.append((img, blocks, to_translate_indices))
 
         total_texts = len(all_texts)
-        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료")
+        extract_elapsed = time.time() - extract_start_time
+        self._log(f"  총 {len(pages)}페이지에서 {total_texts}개 텍스트 추출 완료 ({extract_elapsed:.1f}초)")
 
         # ===== 2단계: 전체 텍스트 일괄 번역 =====
+        translate_start_time = time.time()
         if total_texts > 0:
             self._log(f"2단계: {total_texts}개 텍스트 일괄 번역 중...")
             all_translations = self.translator.translate_batch(all_texts)
@@ -1080,11 +1145,14 @@ class PDFConverter:
                 if all_formulas[i]:
                     all_translations[i] = FormulaDetector.restore_formulas(trans, all_formulas[i])
 
-            self._log("  번역 완료")
+            translate_elapsed = time.time() - translate_start_time
+            self._log(f"  번역 완료 ({translate_elapsed:.1f}초, {total_texts}개 항목)")
         else:
             all_translations = []
+            translate_elapsed = 0
 
         # ===== 3단계: 이미지에 번역 적용 =====
+        apply_start_time = time.time()
         self._log("3단계: 번역 결과 적용 중...")
         translated_images = []
         translation_idx = 0
@@ -1109,7 +1177,8 @@ class PDFConverter:
 
             translated_images.append(img)
 
-        self._log(f"  {len(pages)}페이지 처리 완료")
+        apply_elapsed = time.time() - apply_start_time
+        self._log(f"  {len(pages)}페이지 처리 완료 ({apply_elapsed:.1f}초)")
 
         # PDF 생성 (압축 옵션 적용)
         self._log("4단계: PDF 생성 중...")
@@ -1118,7 +1187,14 @@ class PDFConverter:
         # 이미지 모드에서는 주석이 제거되므로 별도 처리 불필요
         # (원본 PDF 구조가 유지되지 않음)
 
+        # 전체 소요 시간 출력
+        total_elapsed = time.time() - total_start_time
         self._log("  생성 완료")
+        self._log(f"===== 번역 완료: 총 {total_elapsed:.1f}초 소요 =====")
+        self._log(f"  - 텍스트 추출: {extract_elapsed:.1f}초")
+        self._log(f"  - 번역: {translate_elapsed:.1f}초 ({total_texts}개 항목)")
+        self._log(f"  - 결과 적용: {apply_elapsed:.1f}초")
+
         return result_pdf
 
     def _render_page(self, page: fitz.Page) -> Image.Image:
