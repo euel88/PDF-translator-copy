@@ -330,17 +330,21 @@ class FontManager:
         if font_path and Path(font_path).exists():
             return ("custom-font", font_path)
 
-        # PyMuPDF 내장 CJK 폰트 폴백 (더 강력한 매핑)
+        # PyMuPDF 내장 CJK 폰트 폴백
+        # PyMuPDF CJK 내장 폰트:
+        # - "korea" : 한국어 (Korean)
+        # - "japan" : 일본어 (Japanese)
+        # - "china-s" : 중국어 간체 (Simplified Chinese)
+        # - "china-t" : 중국어 번체 (Traditional Chinese)
         lang = language.lower()
 
-        # 한국어
+        # 한국어 - korea 폰트 사용
         if lang in ("ko", "kr", "korean", "kor"):
-            # korea1은 한글 지원, china-s도 한글 일부 지원
-            return ("china-s", None)  # china-s가 더 안정적
+            return ("korea", None)
 
         # 일본어
         elif lang in ("ja", "jp", "japanese", "jpn"):
-            return ("japan1", None)
+            return ("japan", None)
 
         # 중국어 간체
         elif lang in ("zh", "zh-cn", "chinese", "chi", "zho", "chinese-simplified"):
@@ -354,9 +358,9 @@ class FontManager:
         elif lang in ("en", "eng", "english", "de", "fr", "es", "it", "pt", "nl", "pl", "ru"):
             return ("helv", None)
 
-        # 기타 - CJK 폰트가 가장 범용적
+        # 기타 - helv 기본 폰트 사용
         else:
-            return ("china-s", None)
+            return ("helv", None)
 
     def get_font_for_pil(self, language: str, size: int = 12) -> 'ImageFont.FreeTypeFont':
         """
