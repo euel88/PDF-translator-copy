@@ -122,7 +122,7 @@ class WordHandler(BaseDocumentHandler):
             )
 
     def _collect_text_units(self, doc) -> List[TextUnit]:
-        """텍스트 단위 수집 - Run 정보 포함"""
+        """텍스트 단위 수집 - Run 정보 포함 (텍스트 박스, 각주 포함)"""
         units = []
 
         # 1. 본문 단락 수집
@@ -161,6 +161,75 @@ class WordHandler(BaseDocumentHandler):
                     )
                     if unit:
                         units.append(unit)
+
+        # 4. 각주(Footnotes) 수집
+        try:
+            if hasattr(doc, 'part') and doc.part is not None:
+                from docx.oxml.ns import qn
+                footnotes_part = None
+                for rel in doc.part.rels.values():
+                    if 'footnotes' in rel.reltype:
+                        footnotes_part = rel.target_part
+                        break
+
+                if footnotes_part is not None:
+                    footnotes_xml = footnotes_part.element
+                    for fn_idx, footnote in enumerate(footnotes_xml.findall(qn('w:footnote'))):
+                        for para_idx, para_elem in enumerate(footnote.findall(qn('w:p'))):
+                            text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
+                            if text.strip():
+                                # 각주는 직접 XML 파싱하므로 특별 처리
+                                units.append(TextUnit(
+                                    location_type='footnote',
+                                    location_ids=(fn_idx, para_idx),
+                                    runs_info=[RunInfo(text=text)],
+                                    full_text=text
+                                ))
+        except Exception:
+            pass  # 각주 파싱 실패해도 계속
+
+        # 5. 미주(Endnotes) 수집
+        try:
+            if hasattr(doc, 'part') and doc.part is not None:
+                from docx.oxml.ns import qn
+                endnotes_part = None
+                for rel in doc.part.rels.values():
+                    if 'endnotes' in rel.reltype:
+                        endnotes_part = rel.target_part
+                        break
+
+                if endnotes_part is not None:
+                    endnotes_xml = endnotes_part.element
+                    for en_idx, endnote in enumerate(endnotes_xml.findall(qn('w:endnote'))):
+                        for para_idx, para_elem in enumerate(endnote.findall(qn('w:p'))):
+                            text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
+                            if text.strip():
+                                units.append(TextUnit(
+                                    location_type='endnote',
+                                    location_ids=(en_idx, para_idx),
+                                    runs_info=[RunInfo(text=text)],
+                                    full_text=text
+                                ))
+        except Exception:
+            pass  # 미주 파싱 실패해도 계속
+
+        # 6. 텍스트 박스 (도형 내 텍스트) 수집
+        try:
+            from docx.oxml.ns import qn
+            # 문서 본문에서 텍스트 박스 찾기
+            body = doc.element.body
+            for txbx_idx, txbx in enumerate(body.iter(qn('w:txbxContent'))):
+                for para_idx, para_elem in enumerate(txbx.findall(qn('w:p'))):
+                    text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
+                    if text.strip():
+                        units.append(TextUnit(
+                            location_type='textbox',
+                            location_ids=(txbx_idx, para_idx),
+                            runs_info=[RunInfo(text=text)],
+                            full_text=text
+                        ))
+        except Exception:
+            pass  # 텍스트 박스 파싱 실패해도 계속
 
         return units
 
@@ -307,6 +376,13 @@ class WordHandler(BaseDocumentHandler):
                 if para is None:
                     continue
 
+                # XML 기반 요소 처리
+                if isinstance(para, tuple) and para[0] == 'xml_element':
+                    success = self._apply_xml_translation(doc, para[1], para[2], translated)
+                    if success:
+                        translated_count += 1
+                    continue
+
                 # 번역 텍스트를 Run들에 분배
                 self._distribute_text_to_runs(para, unit.runs_info, translated)
                 translated_count += 1
@@ -315,6 +391,72 @@ class WordHandler(BaseDocumentHandler):
                 self.log(f"적용 실패 ({unit.location_type}): {e}")
 
         return translated_count
+
+    def _apply_xml_translation(
+        self,
+        doc,
+        element_type: str,
+        location_ids: tuple,
+        translated: str
+    ) -> bool:
+        """XML 기반 요소에 번역 적용 (각주, 미주, 텍스트박스)"""
+        try:
+            from docx.oxml.ns import qn
+
+            if element_type == 'footnote':
+                fn_idx, para_idx = location_ids
+                for rel in doc.part.rels.values():
+                    if 'footnotes' in rel.reltype:
+                        footnotes_xml = rel.target_part.element
+                        footnotes = list(footnotes_xml.findall(qn('w:footnote')))
+                        if fn_idx < len(footnotes):
+                            paras = list(footnotes[fn_idx].findall(qn('w:p')))
+                            if para_idx < len(paras):
+                                self._replace_paragraph_text_xml(paras[para_idx], translated)
+                                return True
+
+            elif element_type == 'endnote':
+                en_idx, para_idx = location_ids
+                for rel in doc.part.rels.values():
+                    if 'endnotes' in rel.reltype:
+                        endnotes_xml = rel.target_part.element
+                        endnotes = list(endnotes_xml.findall(qn('w:endnote')))
+                        if en_idx < len(endnotes):
+                            paras = list(endnotes[en_idx].findall(qn('w:p')))
+                            if para_idx < len(paras):
+                                self._replace_paragraph_text_xml(paras[para_idx], translated)
+                                return True
+
+            elif element_type == 'textbox':
+                txbx_idx, para_idx = location_ids
+                body = doc.element.body
+                textboxes = list(body.iter(qn('w:txbxContent')))
+                if txbx_idx < len(textboxes):
+                    paras = list(textboxes[txbx_idx].findall(qn('w:p')))
+                    if para_idx < len(paras):
+                        self._replace_paragraph_text_xml(paras[para_idx], translated)
+                        return True
+
+        except Exception as e:
+            self.log(f"XML 번역 적용 실패 ({element_type}): {e}")
+
+        return False
+
+    def _replace_paragraph_text_xml(self, para_elem, new_text: str):
+        """XML 단락의 텍스트 교체"""
+        from docx.oxml.ns import qn
+
+        # 기존 텍스트 요소 찾기
+        text_elements = list(para_elem.iter(qn('w:t')))
+        if not text_elements:
+            return
+
+        # 첫 번째 텍스트 요소에 전체 번역 텍스트 설정
+        text_elements[0].text = new_text
+
+        # 나머지 텍스트 요소는 비우기
+        for t_elem in text_elements[1:]:
+            t_elem.text = ""
 
     def _get_paragraph(self, doc, unit: TextUnit):
         """위치 정보로 단락 가져오기"""
@@ -334,6 +476,10 @@ class WordHandler(BaseDocumentHandler):
             elif unit.location_type == 'footer':
                 section_idx, para_idx = unit.location_ids
                 return doc.sections[section_idx].footer.paragraphs[para_idx]
+
+            elif unit.location_type in ('footnote', 'endnote', 'textbox'):
+                # XML 기반 요소는 특별 처리 필요
+                return ('xml_element', unit.location_type, unit.location_ids)
 
         except (IndexError, KeyError):
             return None
