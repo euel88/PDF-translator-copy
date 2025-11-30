@@ -626,10 +626,15 @@ class PDFConverter:
         self._log("3단계: 번역 결과 적용 중...")
         output_doc = fitz.open()
         translation_idx = 0
+        total_pages = len(page_data)
 
-        for page_num, blocks, to_translate_indices in page_data:
+        for idx, (page_num, blocks, to_translate_indices) in enumerate(page_data):
             if self._cancelled:
                 break
+
+            # 진행 상황 로깅 (5페이지마다 또는 마지막 페이지)
+            if idx % 5 == 0 or idx == total_pages - 1:
+                self._log(f"  페이지 {idx + 1}/{total_pages} 처리 중...")
 
             # 원본 페이지 복사
             page = doc[page_num]
@@ -653,6 +658,7 @@ class PDFConverter:
         self._log(f"  {len(pages)}페이지 처리 완료")
 
         # 압축 옵션으로 저장
+        self._log("4단계: PDF 저장 중...")
         output = io.BytesIO()
         output_doc.save(
             output,
@@ -661,6 +667,7 @@ class PDFConverter:
             clean=True,  # 사용하지 않는 객체 제거
         )
         output_doc.close()
+        self._log("  저장 완료")
 
         return output.getvalue()
 
@@ -1077,10 +1084,15 @@ class PDFConverter:
         self._log("3단계: 번역 결과 적용 중...")
         translated_images = []
         translation_idx = 0
+        total_pages = len(page_data)
 
-        for img, blocks, to_translate_indices in page_data:
+        for idx, (img, blocks, to_translate_indices) in enumerate(page_data):
             if self._cancelled:
                 break
+
+            # 진행 상황 로깅 (5페이지마다 또는 마지막 페이지)
+            if idx % 5 == 0 or idx == total_pages - 1:
+                self._log(f"  페이지 {idx + 1}/{total_pages} 처리 중...")
 
             if to_translate_indices:
                 # 이 페이지의 번역 결과
@@ -1096,7 +1108,10 @@ class PDFConverter:
         self._log(f"  {len(pages)}페이지 처리 완료")
 
         # PDF 생성 (압축 옵션 적용)
-        return self._create_pdf(translated_images)
+        self._log("4단계: PDF 생성 중...")
+        result = self._create_pdf(translated_images)
+        self._log("  생성 완료")
+        return result
 
     def _render_page(self, page: fitz.Page) -> Image.Image:
         """페이지 렌더링"""
