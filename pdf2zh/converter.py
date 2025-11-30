@@ -903,76 +903,79 @@ class PDFConverter:
             font_size = block.font_size
             text_color = tuple(c / 255 for c in block.color)
 
-            # 폰트 선택
+            # 대상 언어에 맞는 CJK 내장 폰트
+            cjk_fontname = self._get_vector_fontname("")
+
+            # 폰트 후보 목록 (우선순위 순서)
+            font_candidates = []
             if font_registered:
-                fontname = "korean-font"
-            else:
-                fontname = self._get_vector_fontname(block.font_name)
+                font_candidates.append("korean-font")
+            font_candidates.append(cjk_fontname)  # 대상 언어에 맞는 CJK 폰트
+            font_candidates.append("helv")  # 라틴 기본 폰트
 
-            # 텍스트 맞춤 (원본 크기 유지 시도, 필요시 축소)
-            adjusted_size, fitted_text = self._fit_text_vector_improved(
-                page, translation, rect, font_size, fontname
-            )
+            # 텍스트 맞춤 테스트 및 적합한 폰트 찾기
+            working_font = None
+            working_size = font_size * 0.9
+            working_text = translation
 
-            # 텍스트 삽입 시도
-            text_inserted = False
-
-            # 1차 시도: 등록된 폰트 사용
-            try:
-                # 먼저 원본 텍스트 영역을 배경색으로 덮기
-                pad_x = 0.5  # 수평 패딩 최소화
-                pad_y = 0.5  # 수직 패딩 최소화
-                cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
-                page.draw_rect(cover_rect, color=None, fill=bg_color)
-
-                # 번역된 텍스트 삽입 (줄간격 적용)
-                page.insert_textbox(
-                    rect,
-                    fitted_text,
-                    fontsize=adjusted_size,
-                    fontname=fontname,
-                    color=text_color,
-                    align=fitz.TEXT_ALIGN_LEFT,
-                    lineheight=self.line_height,
-                )
-                text_inserted = True
-            except Exception:
-                pass
-
-            # 2차 시도: 기본 폰트 (helv) 사용
-            if not text_inserted:
+            for fontname in font_candidates:
                 try:
-                    # 원본 영역 덮기 (아직 안 덮었으면)
-                    pad_x = 0.5
-                    pad_y = 0.5
-                    cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
-                    page.draw_rect(cover_rect, color=None, fill=bg_color)
+                    # 삽입 테스트 (overlay=False는 실제로 삽입하지 않고 테스트)
+                    adjusted_size, fitted_text = self._fit_text_vector_improved(
+                        page, translation, rect, font_size, fontname
+                    )
+                    if adjusted_size >= 6:  # 최소 크기 이상이면 사용 가능
+                        working_font = fontname
+                        working_size = adjusted_size
+                        working_text = fitted_text
+                        break
+                except Exception:
+                    continue
 
+            # 적합한 폰트를 찾지 못한 경우 기본값 사용
+            if working_font is None:
+                working_font = cjk_fontname
+                working_size = max(6, font_size * 0.5)
+                working_text = translation
+
+            # 원본 텍스트 영역을 배경색으로 덮기
+            pad_x = 0.5
+            pad_y = 0.5
+            cover_rect = fitz.Rect(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y)
+            page.draw_rect(cover_rect, color=None, fill=bg_color)
+
+            # 번역된 텍스트 삽입
+            text_inserted = False
+            for fontname in [working_font] + font_candidates:
+                if text_inserted:
+                    break
+                try:
                     page.insert_textbox(
                         rect,
-                        fitted_text,
-                        fontsize=adjusted_size,
-                        fontname="helv",
+                        working_text,
+                        fontsize=working_size,
+                        fontname=fontname,
                         color=text_color,
                         align=fitz.TEXT_ALIGN_LEFT,
+                        lineheight=self.line_height,
                     )
                     text_inserted = True
                 except Exception:
-                    pass
+                    continue
 
-            # 3차 시도: CJK 폰트로 원본 텍스트라도 복원 시도
+            # 모든 시도 실패 시 원본 텍스트라도 삽입 시도
             if not text_inserted:
                 try:
                     page.insert_textbox(
                         rect,
-                        block.text,  # 원본 텍스트로 복원
+                        block.text,
                         fontsize=font_size,
-                        fontname="china-s",  # CJK 폰트
+                        fontname=cjk_fontname,
                         color=text_color,
                         align=fitz.TEXT_ALIGN_LEFT,
                     )
                 except Exception:
-                    # 최종 폴백 실패 - 원본 영역이 덮였을 수 있으나 복구 불가
+                    # 최종 폴백 실패 - 로깅만 수행
                     pass
 
     def _detect_bg_color_from_pixmap(
@@ -1148,17 +1151,26 @@ class PDFConverter:
         return min_size, text
 
     def _get_vector_fontname(self, font_name: str) -> str:
-        """벡터 텍스트용 폰트 이름 반환"""
-        font_name_lower = font_name.lower()
+        """벡터 텍스트용 폰트 이름 반환 - 대상 언어에 맞는 CJK 폰트 선택"""
+        # 대상 언어에 따라 적절한 CJK 폰트 선택
+        target_lang_lower = self.target_lang.lower()
 
-        # PyMuPDF 내장 폰트 중 선택
-        # 한글 지원을 위해 korea1 CJK 폰트 사용 시도
-        if any(s in font_name_lower for s in ["bold", "heavy"]):
-            return "china-s"  # CJK 폰트 (한글 포함)
-        elif any(s in font_name_lower for s in ["serif", "times", "batang"]):
+        # PyMuPDF 내장 CJK 폰트:
+        # - "korea" : 한국어 (Korean)
+        # - "japan" : 일본어 (Japanese)
+        # - "china-s" : 중국어 간체 (Simplified Chinese)
+        # - "china-t" : 중국어 번체 (Traditional Chinese)
+        if target_lang_lower in ("ko", "kr", "kor", "korean"):
+            return "korea"
+        elif target_lang_lower in ("ja", "jp", "jpn", "japanese"):
+            return "japan"
+        elif target_lang_lower in ("zh-tw", "zh-hant", "traditional chinese", "chinese-traditional"):
+            return "china-t"
+        elif target_lang_lower in ("zh", "zh-cn", "zh-hans", "chinese", "simplified chinese"):
             return "china-s"
         else:
-            return "china-s"  # 기본적으로 CJK 폰트 사용
+            # 기타 언어는 기본 폰트 사용 (라틴 계열)
+            return "helv"
 
     def _convert_image_mode(
         self,
@@ -1785,12 +1797,20 @@ class PDFConverter:
 
     def _get_font(self, size: int, font_name: str = "") -> ImageFont.FreeTypeFont:
         """
-        폰트 반환 - 원본 폰트 스타일에 맞게 선택
+        폰트 반환 - 폰트 관리자를 통해 최적의 폰트 선택
 
         Args:
             size: 폰트 크기
             font_name: 원본 폰트 이름 (스타일 매칭용)
         """
+        # 1. 먼저 font_manager를 통해 대상 언어에 맞는 폰트 시도
+        try:
+            font_path = font_manager.get_font_path(self.target_lang)
+            if font_path and Path(font_path).exists():
+                return ImageFont.truetype(font_path, size)
+        except Exception:
+            pass
+
         font_name_lower = font_name.lower()
 
         # 폰트 스타일 감지
