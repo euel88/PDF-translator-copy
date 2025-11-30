@@ -180,6 +180,10 @@ class OpenAITranslator(BaseTranslator):
     name = "openai"
     FORMULA_PLACEHOLDER = "{{{{v{id}}}}}"  # OpenAI용 이중 중괄호
 
+    # 배치 크기 설정 (성능 최적화)
+    MAX_BATCH_SIZE = 20  # 5 → 20으로 증가 (API 호출 4배 감소)
+    MAX_BATCH_CHARS = 8000  # 배치당 최대 문자 수 (토큰 제한 방지)
+
     def __init__(self, source_lang: str, target_lang: str, **kwargs):
         super().__init__(source_lang, target_lang, **kwargs)
         self.api_key = kwargs.get("api_key") or config.get("OPENAI_API_KEY", "")
@@ -193,7 +197,7 @@ class OpenAITranslator(BaseTranslator):
             from openai import OpenAI
             kwargs = {
                 "api_key": self.api_key,
-                "timeout": 120.0,  # 120초 타임아웃
+                "timeout": 180.0,  # 120 → 180초 타임아웃 (대용량 배치용)
             }
             if self.base_url:
                 kwargs["base_url"] = self.base_url
@@ -232,7 +236,7 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역 (최적화) - 결과 검증 및 폴백 강화"""
+        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리"""
         if not texts:
             return []
 
@@ -253,30 +257,77 @@ Rules:
         if not to_translate:
             return results
 
-        # 배치가 너무 크면 분할 처리 (출력 토큰 제한 방지)
-        MAX_BATCH_SIZE = 5  # 안전한 배치 크기
-        if len(to_translate) > MAX_BATCH_SIZE:
-            print(f"[OpenAI] 배치 분할: {len(to_translate)}개 → {MAX_BATCH_SIZE}개씩")
-            for batch_start in range(0, len(to_translate), MAX_BATCH_SIZE):
-                batch_items = to_translate[batch_start:batch_start + MAX_BATCH_SIZE]
-                batch_texts = [texts[idx] for idx, _ in batch_items]
-                batch_results = self._translate_batch_safe(batch_items)
-                for (orig_idx, orig_text), translated in zip(batch_items, batch_results):
+        # 스마트 배치 분할 (개수 + 문자 수 기준)
+        batches = self._create_smart_batches(to_translate)
+        total_batches = len(batches)
+
+        if total_batches > 1:
+            print(f"[OpenAI] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치")
+
+        # 병렬 배치 처리 (최대 3개 동시 실행)
+        if total_batches > 1 and self.num_threads > 1:
+            batch_results_map = {}
+
+            def process_batch(batch_idx: int, batch_items: List[tuple]) -> tuple:
+                try:
+                    batch_result = self._translate_batch_safe(batch_items)
+                    return (batch_idx, batch_result)
+                except Exception as e:
+                    print(f"[OpenAI] 배치 {batch_idx+1} 오류: {e}")
+                    return (batch_idx, [item[1] for item in batch_items])
+
+            with ThreadPoolExecutor(max_workers=min(3, total_batches)) as executor:
+                futures = {
+                    executor.submit(process_batch, idx, batch): idx
+                    for idx, batch in enumerate(batches)
+                }
+                for future in as_completed(futures):
+                    batch_idx, batch_result = future.result()
+                    batch_results_map[batch_idx] = batch_result
+
+            # 결과 병합 (순서 유지)
+            for batch_idx, batch in enumerate(batches):
+                batch_result = batch_results_map.get(batch_idx, [item[1] for item in batch])
+                for (orig_idx, orig_text), translated in zip(batch, batch_result):
                     results[orig_idx] = translated
                     if self.use_cache and translated != orig_text:
                         cache.set(orig_text, self.source_lang, self.target_lang,
                                   self.name, translated)
-            return results
-
-        # 단일 배치 처리
-        batch_results = self._translate_batch_safe(to_translate)
-        for (orig_idx, orig_text), translated in zip(to_translate, batch_results):
-            results[orig_idx] = translated
-            if self.use_cache and translated != orig_text:
-                cache.set(orig_text, self.source_lang, self.target_lang,
-                          self.name, translated)
+        else:
+            # 순차 처리 (배치가 적거나 단일 스레드)
+            for batch in batches:
+                batch_results = self._translate_batch_safe(batch)
+                for (orig_idx, orig_text), translated in zip(batch, batch_results):
+                    results[orig_idx] = translated
+                    if self.use_cache and translated != orig_text:
+                        cache.set(orig_text, self.source_lang, self.target_lang,
+                                  self.name, translated)
 
         return results
+
+    def _create_smart_batches(self, items: List[tuple]) -> List[List[tuple]]:
+        """스마트 배치 분할 - 개수와 문자 수 기준"""
+        batches = []
+        current_batch = []
+        current_chars = 0
+
+        for item in items:
+            text_len = len(item[1])
+            # 배치 크기 또는 문자 수 초과 시 새 배치
+            if (len(current_batch) >= self.MAX_BATCH_SIZE or
+                    current_chars + text_len > self.MAX_BATCH_CHARS):
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [item]
+                current_chars = text_len
+            else:
+                current_batch.append(item)
+                current_chars += text_len
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     def _translate_batch_safe(self, items: List[tuple]) -> List[str]:
         """안전한 배치 번역 - 결과 검증 및 개별 폴백"""
@@ -289,9 +340,13 @@ Rules:
             numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
 
         numbered = "\n".join(numbered_parts)
-        prompt = f"""Translate each numbered item below. Keep the <<<N>>> markers exactly as shown. Output ALL items with their markers.
+        prompt = f"""Translate ALL {len(items)} items below from {self.source_lang} to {self.target_lang}.
+IMPORTANT: Output EVERY item with its <<<N>>> marker. Do not skip any item.
 
 {numbered}"""
+
+        # 출력 토큰 계산 (입력 문자 수 * 1.5 예상)
+        estimated_output_tokens = min(8192, max(4096, sum(len(item[1]) for item in items) * 2))
 
         try:
             response = self.client.chat.completions.create(
@@ -301,7 +356,7 @@ Rules:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
-                max_tokens=4096,
+                max_tokens=estimated_output_tokens,
             )
 
             result_text = response.choices[0].message.content.strip()
@@ -436,6 +491,10 @@ class ClaudeTranslator(BaseTranslator):
     name = "claude"
     FORMULA_PLACEHOLDER = "{{{{v{id}}}}}"
 
+    # 배치 크기 설정 (성능 최적화)
+    MAX_BATCH_SIZE = 20  # 5 → 20으로 증가
+    MAX_BATCH_CHARS = 10000  # Claude는 더 큰 컨텍스트 처리 가능
+
     def __init__(self, source_lang: str, target_lang: str, **kwargs):
         super().__init__(source_lang, target_lang, **kwargs)
         self.api_key = kwargs.get("api_key") or config.get("ANTHROPIC_API_KEY", "")
@@ -446,7 +505,7 @@ class ClaudeTranslator(BaseTranslator):
     def client(self):
         if self._client is None:
             from anthropic import Anthropic
-            self._client = Anthropic(api_key=self.api_key)
+            self._client = Anthropic(api_key=self.api_key, timeout=180.0)
         return self._client
 
     def _get_prompt(self) -> str:
@@ -479,7 +538,7 @@ Rules:
             return text
 
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """배치 번역 - 결과 검증 및 폴백 강화"""
+        """배치 번역 (최적화) - 스마트 배치 분할 및 병렬 처리"""
         if not texts:
             return []
 
@@ -500,29 +559,77 @@ Rules:
         if not to_translate:
             return results
 
-        # 배치가 너무 크면 분할 처리 (출력 토큰 제한 방지)
-        MAX_BATCH_SIZE = 5  # 안전한 배치 크기
-        if len(to_translate) > MAX_BATCH_SIZE:
-            print(f"[Claude] 배치 분할: {len(to_translate)}개 → {MAX_BATCH_SIZE}개씩")
-            for batch_start in range(0, len(to_translate), MAX_BATCH_SIZE):
-                batch_items = to_translate[batch_start:batch_start + MAX_BATCH_SIZE]
-                batch_results = self._translate_batch_safe(batch_items)
-                for (orig_idx, orig_text), translated in zip(batch_items, batch_results):
+        # 스마트 배치 분할 (개수 + 문자 수 기준)
+        batches = self._create_smart_batches(to_translate)
+        total_batches = len(batches)
+
+        if total_batches > 1:
+            print(f"[Claude] 스마트 배치: {len(to_translate)}개 → {total_batches}개 배치")
+
+        # 병렬 배치 처리 (최대 3개 동시 실행)
+        if total_batches > 1 and self.num_threads > 1:
+            batch_results_map = {}
+
+            def process_batch(batch_idx: int, batch_items: List[tuple]) -> tuple:
+                try:
+                    batch_result = self._translate_batch_safe(batch_items)
+                    return (batch_idx, batch_result)
+                except Exception as e:
+                    print(f"[Claude] 배치 {batch_idx+1} 오류: {e}")
+                    return (batch_idx, [item[1] for item in batch_items])
+
+            with ThreadPoolExecutor(max_workers=min(3, total_batches)) as executor:
+                futures = {
+                    executor.submit(process_batch, idx, batch): idx
+                    for idx, batch in enumerate(batches)
+                }
+                for future in as_completed(futures):
+                    batch_idx, batch_result = future.result()
+                    batch_results_map[batch_idx] = batch_result
+
+            # 결과 병합 (순서 유지)
+            for batch_idx, batch in enumerate(batches):
+                batch_result = batch_results_map.get(batch_idx, [item[1] for item in batch])
+                for (orig_idx, orig_text), translated in zip(batch, batch_result):
                     results[orig_idx] = translated
                     if self.use_cache and translated != orig_text:
                         cache.set(orig_text, self.source_lang, self.target_lang,
                                   self.name, translated)
-            return results
-
-        # 단일 배치 처리
-        batch_results = self._translate_batch_safe(to_translate)
-        for (orig_idx, orig_text), translated in zip(to_translate, batch_results):
-            results[orig_idx] = translated
-            if self.use_cache and translated != orig_text:
-                cache.set(orig_text, self.source_lang, self.target_lang,
-                          self.name, translated)
+        else:
+            # 순차 처리 (배치가 적거나 단일 스레드)
+            for batch in batches:
+                batch_results = self._translate_batch_safe(batch)
+                for (orig_idx, orig_text), translated in zip(batch, batch_results):
+                    results[orig_idx] = translated
+                    if self.use_cache and translated != orig_text:
+                        cache.set(orig_text, self.source_lang, self.target_lang,
+                                  self.name, translated)
 
         return results
+
+    def _create_smart_batches(self, items: List[tuple]) -> List[List[tuple]]:
+        """스마트 배치 분할 - 개수와 문자 수 기준"""
+        batches = []
+        current_batch = []
+        current_chars = 0
+
+        for item in items:
+            text_len = len(item[1])
+            # 배치 크기 또는 문자 수 초과 시 새 배치
+            if (len(current_batch) >= self.MAX_BATCH_SIZE or
+                    current_chars + text_len > self.MAX_BATCH_CHARS):
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [item]
+                current_chars = text_len
+            else:
+                current_batch.append(item)
+                current_chars += text_len
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     def _translate_batch_safe(self, items: List[tuple]) -> List[str]:
         """안전한 배치 번역 - 결과 검증 및 개별 폴백"""
@@ -535,14 +642,18 @@ Rules:
             numbered_parts.append(f"{separator.format(idx=idx+1)} {safe_text}")
 
         numbered = "\n".join(numbered_parts)
-        prompt = f"""Translate each numbered item below. Keep the <<<N>>> markers exactly as shown. Output ALL items with their markers.
+        prompt = f"""Translate ALL {len(items)} items below from {self.source_lang} to {self.target_lang}.
+IMPORTANT: Output EVERY item with its <<<N>>> marker. Do not skip any item.
 
 {numbered}"""
+
+        # 출력 토큰 계산 (입력 문자 수 * 2 예상)
+        estimated_output_tokens = min(16000, max(8192, sum(len(item[1]) for item in items) * 2))
 
         try:
             message = self.client.messages.create(
                 model=self.model,
-                max_tokens=8192,
+                max_tokens=estimated_output_tokens,
                 system=self._get_prompt(),
                 messages=[{"role": "user", "content": prompt}],
             )
