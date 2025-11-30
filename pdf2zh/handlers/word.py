@@ -122,50 +122,94 @@ class WordHandler(BaseDocumentHandler):
             )
 
     def _collect_text_units(self, doc) -> List[TextUnit]:
-        """텍스트 단위 수집 - Run 정보 포함 (텍스트 박스, 각주 포함)"""
+        """텍스트 단위 수집 - Run 정보 포함 (모든 텍스트 요소 포함)"""
         units = []
+        from docx.oxml.ns import qn
+
+        # 수집 통계
+        stats = {
+            'paragraph': 0, 'table': 0, 'header': 0, 'footer': 0,
+            'footnote': 0, 'endnote': 0, 'textbox': 0, 'sdt': 0
+        }
 
         # 1. 본문 단락 수집
         for para_idx, para in enumerate(doc.paragraphs):
             unit = self._extract_paragraph_unit(para, 'paragraph', (para_idx,))
             if unit:
                 units.append(unit)
+                stats['paragraph'] += 1
 
-        # 2. 표 수집
+        # 2. 표 수집 (중첩 표 포함)
         for table_idx, table in enumerate(doc.tables):
-            for row_idx, row in enumerate(table.rows):
-                for cell_idx, cell in enumerate(row.cells):
-                    for para_idx, para in enumerate(cell.paragraphs):
-                        unit = self._extract_paragraph_unit(
-                            para, 'table', (table_idx, row_idx, cell_idx, para_idx)
-                        )
-                        if unit:
-                            units.append(unit)
+            self._collect_table_text(table, table_idx, units, stats)
 
-        # 3. 헤더/푸터 수집
+        # 3. 헤더/푸터 수집 (모든 유형)
         for section_idx, section in enumerate(doc.sections):
-            # 헤더
-            if section.header:
-                for para_idx, para in enumerate(section.header.paragraphs):
-                    unit = self._extract_paragraph_unit(
-                        para, 'header', (section_idx, para_idx)
-                    )
-                    if unit:
-                        units.append(unit)
+            # 모든 헤더 유형 수집
+            for header_type in ['header', 'first_page_header', 'even_page_header']:
+                try:
+                    header = getattr(section, header_type, None)
+                    if header and header.is_linked_to_previous is False:
+                        for para_idx, para in enumerate(header.paragraphs):
+                            unit = self._extract_paragraph_unit(
+                                para, 'header', (section_idx, header_type, para_idx)
+                            )
+                            if unit:
+                                units.append(unit)
+                                stats['header'] += 1
+                        # 헤더 내 표
+                        for tbl_idx, table in enumerate(header.tables):
+                            self._collect_table_text(
+                                table, f"header_{section_idx}_{tbl_idx}",
+                                units, stats, location_prefix='header_table'
+                            )
+                except Exception:
+                    pass
 
-            # 푸터
-            if section.footer:
-                for para_idx, para in enumerate(section.footer.paragraphs):
-                    unit = self._extract_paragraph_unit(
-                        para, 'footer', (section_idx, para_idx)
-                    )
-                    if unit:
-                        units.append(unit)
+            # 모든 푸터 유형 수집
+            for footer_type in ['footer', 'first_page_footer', 'even_page_footer']:
+                try:
+                    footer = getattr(section, footer_type, None)
+                    if footer and footer.is_linked_to_previous is False:
+                        for para_idx, para in enumerate(footer.paragraphs):
+                            unit = self._extract_paragraph_unit(
+                                para, 'footer', (section_idx, footer_type, para_idx)
+                            )
+                            if unit:
+                                units.append(unit)
+                                stats['footer'] += 1
+                        # 푸터 내 표
+                        for tbl_idx, table in enumerate(footer.tables):
+                            self._collect_table_text(
+                                table, f"footer_{section_idx}_{tbl_idx}",
+                                units, stats, location_prefix='footer_table'
+                            )
+                except Exception:
+                    pass
 
-        # 4. 각주(Footnotes) 수집
+        # 4. 콘텐츠 컨트롤 (SDT) 수집 - 많은 Word 문서에서 사용
+        try:
+            body = doc.element.body
+            for sdt_idx, sdt in enumerate(body.iter(qn('w:sdt'))):
+                # SDT 내의 모든 텍스트 수집
+                sdt_content = sdt.find(qn('w:sdtContent'))
+                if sdt_content is not None:
+                    for para_idx, para_elem in enumerate(sdt_content.findall(qn('w:p'))):
+                        text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
+                        if text.strip():
+                            units.append(TextUnit(
+                                location_type='sdt',
+                                location_ids=(sdt_idx, para_idx),
+                                runs_info=[RunInfo(text=text)],
+                                full_text=text
+                            ))
+                            stats['sdt'] += 1
+        except Exception:
+            pass
+
+        # 5. 각주(Footnotes) 수집
         try:
             if hasattr(doc, 'part') and doc.part is not None:
-                from docx.oxml.ns import qn
                 footnotes_part = None
                 for rel in doc.part.rels.values():
                     if 'footnotes' in rel.reltype:
@@ -178,20 +222,19 @@ class WordHandler(BaseDocumentHandler):
                         for para_idx, para_elem in enumerate(footnote.findall(qn('w:p'))):
                             text = ''.join(t.text or '' for t in para_elem.iter(qn('w:t')))
                             if text.strip():
-                                # 각주는 직접 XML 파싱하므로 특별 처리
                                 units.append(TextUnit(
                                     location_type='footnote',
                                     location_ids=(fn_idx, para_idx),
                                     runs_info=[RunInfo(text=text)],
                                     full_text=text
                                 ))
+                                stats['footnote'] += 1
         except Exception:
-            pass  # 각주 파싱 실패해도 계속
+            pass
 
-        # 5. 미주(Endnotes) 수집
+        # 6. 미주(Endnotes) 수집
         try:
             if hasattr(doc, 'part') and doc.part is not None:
-                from docx.oxml.ns import qn
                 endnotes_part = None
                 for rel in doc.part.rels.values():
                     if 'endnotes' in rel.reltype:
@@ -210,13 +253,12 @@ class WordHandler(BaseDocumentHandler):
                                     runs_info=[RunInfo(text=text)],
                                     full_text=text
                                 ))
+                                stats['endnote'] += 1
         except Exception:
-            pass  # 미주 파싱 실패해도 계속
+            pass
 
-        # 6. 텍스트 박스 (도형 내 텍스트) 수집
+        # 7. 텍스트 박스 (도형 내 텍스트) 수집
         try:
-            from docx.oxml.ns import qn
-            # 문서 본문에서 텍스트 박스 찾기
             body = doc.element.body
             for txbx_idx, txbx in enumerate(body.iter(qn('w:txbxContent'))):
                 for para_idx, para_elem in enumerate(txbx.findall(qn('w:p'))):
@@ -228,10 +270,44 @@ class WordHandler(BaseDocumentHandler):
                             runs_info=[RunInfo(text=text)],
                             full_text=text
                         ))
+                        stats['textbox'] += 1
         except Exception:
-            pass  # 텍스트 박스 파싱 실패해도 계속
+            pass
+
+        # 수집 통계 로깅
+        self.log(f"텍스트 수집 완료: 본문 {stats['paragraph']}, 표 {stats['table']}, "
+                 f"헤더 {stats['header']}, 푸터 {stats['footer']}, SDT {stats['sdt']}, "
+                 f"텍스트박스 {stats['textbox']}, 각주 {stats['footnote']}, 미주 {stats['endnote']}")
 
         return units
+
+    def _collect_table_text(
+        self,
+        table,
+        table_id,
+        units: List[TextUnit],
+        stats: dict,
+        location_prefix: str = 'table'
+    ):
+        """표에서 텍스트 수집 (중첩 표 포함)"""
+        for row_idx, row in enumerate(table.rows):
+            for cell_idx, cell in enumerate(row.cells):
+                # 셀 내 단락
+                for para_idx, para in enumerate(cell.paragraphs):
+                    unit = self._extract_paragraph_unit(
+                        para, location_prefix, (table_id, row_idx, cell_idx, para_idx)
+                    )
+                    if unit:
+                        units.append(unit)
+                        stats['table'] += 1
+
+                # 셀 내 중첩 표
+                for nested_idx, nested_table in enumerate(cell.tables):
+                    self._collect_table_text(
+                        nested_table,
+                        f"{table_id}_nested_{nested_idx}",
+                        units, stats, location_prefix
+                    )
 
     def _extract_paragraph_unit(
         self,
@@ -437,6 +513,18 @@ class WordHandler(BaseDocumentHandler):
                         self._replace_paragraph_text_xml(paras[para_idx], translated)
                         return True
 
+            elif element_type == 'sdt':
+                sdt_idx, para_idx = location_ids
+                body = doc.element.body
+                sdts = list(body.iter(qn('w:sdt')))
+                if sdt_idx < len(sdts):
+                    sdt_content = sdts[sdt_idx].find(qn('w:sdtContent'))
+                    if sdt_content is not None:
+                        paras = list(sdt_content.findall(qn('w:p')))
+                        if para_idx < len(paras):
+                            self._replace_paragraph_text_xml(paras[para_idx], translated)
+                            return True
+
         except Exception as e:
             self.log(f"XML 번역 적용 실패 ({element_type}): {e}")
 
@@ -466,22 +554,45 @@ class WordHandler(BaseDocumentHandler):
                 return doc.paragraphs[para_idx]
 
             elif unit.location_type == 'table':
-                table_idx, row_idx, cell_idx, para_idx = unit.location_ids
-                return doc.tables[table_idx].rows[row_idx].cells[cell_idx].paragraphs[para_idx]
+                table_id, row_idx, cell_idx, para_idx = unit.location_ids
+                # 중첩 표 처리 (table_id가 문자열일 수 있음)
+                if isinstance(table_id, int):
+                    return doc.tables[table_id].rows[row_idx].cells[cell_idx].paragraphs[para_idx]
+                else:
+                    # 중첩 표는 XML로 처리
+                    return ('xml_element', unit.location_type, unit.location_ids)
 
             elif unit.location_type == 'header':
-                section_idx, para_idx = unit.location_ids
-                return doc.sections[section_idx].header.paragraphs[para_idx]
+                # 새 형식: (section_idx, header_type, para_idx) 또는 기존 형식
+                if len(unit.location_ids) == 3:
+                    section_idx, header_type, para_idx = unit.location_ids
+                    header = getattr(doc.sections[section_idx], header_type, None)
+                    if header:
+                        return header.paragraphs[para_idx]
+                else:
+                    section_idx, para_idx = unit.location_ids
+                    return doc.sections[section_idx].header.paragraphs[para_idx]
 
             elif unit.location_type == 'footer':
-                section_idx, para_idx = unit.location_ids
-                return doc.sections[section_idx].footer.paragraphs[para_idx]
+                # 새 형식: (section_idx, footer_type, para_idx) 또는 기존 형식
+                if len(unit.location_ids) == 3:
+                    section_idx, footer_type, para_idx = unit.location_ids
+                    footer = getattr(doc.sections[section_idx], footer_type, None)
+                    if footer:
+                        return footer.paragraphs[para_idx]
+                else:
+                    section_idx, para_idx = unit.location_ids
+                    return doc.sections[section_idx].footer.paragraphs[para_idx]
 
-            elif unit.location_type in ('footnote', 'endnote', 'textbox'):
+            elif unit.location_type in ('footnote', 'endnote', 'textbox', 'sdt'):
                 # XML 기반 요소는 특별 처리 필요
                 return ('xml_element', unit.location_type, unit.location_ids)
 
-        except (IndexError, KeyError):
+            elif unit.location_type in ('header_table', 'footer_table'):
+                # 헤더/푸터 내 표는 XML로 처리
+                return ('xml_element', unit.location_type, unit.location_ids)
+
+        except (IndexError, KeyError, AttributeError):
             return None
 
         return None
