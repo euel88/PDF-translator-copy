@@ -23,14 +23,15 @@ class FontInfo:
 
 
 # Go Noto Universal 폰트 다운로드 정보
+# 공식 저장소: https://github.com/satbyy/go-noto-universal
 GO_NOTO_FONTS = {
     "GoNotoKurrent-Regular": {
-        "url": "https://github.com/nicovank/Go-Noto-Universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf",
+        "url": "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf",
         "sha256": None,  # 실제 해시 필요
         "languages": ["all"],
     },
     "GoNotoKurrent-Bold": {
-        "url": "https://github.com/nicovank/Go-Noto-Universal/releases/download/v7.0/GoNotoKurrent-Bold.ttf",
+        "url": "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Bold.ttf",
         "sha256": None,
         "languages": ["all"],
     },
