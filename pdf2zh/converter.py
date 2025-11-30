@@ -54,6 +54,7 @@ class TextBlock:
     font_name: str
     color: Tuple[int, int, int]
     is_formula: bool = False
+    is_vertical: bool = False  # 수직 텍스트 여부 (PDFMathTranslate 참고)
 
     @property
     def x0(self): return self.bbox[0]
@@ -82,6 +83,47 @@ class TranslateResult:
 
 class FormulaDetector:
     """수식 감지기 - PDFMathTranslate 수준의 완벽한 LaTeX 보존"""
+
+    # 수학 폰트 패턴 (PDFMathTranslate 참고)
+    # Computer Modern, MathTime, Symbol 등 LaTeX/수학 폰트 감지
+    MATH_FONT_PATTERNS = [
+        r"^CM[^RT]",           # Computer Modern (CMR, CMB 제외 - 일반 텍스트)
+        r"^CMSY",              # Computer Modern Symbol
+        r"^CMMI",              # Computer Modern Math Italic
+        r"^CMEX",              # Computer Modern Extension
+        r"^MS[A-Z]?M",         # Math Symbol fonts
+        r"^Math",              # Generic Math fonts
+        r"^Symbol",            # Symbol font
+        r"^MT[A-Z]*",          # MathTime fonts
+        r"^Euclid",            # Euclid math fonts
+        r"^STIX",              # STIX math fonts
+        r"^.*Math.*",          # Any font with "Math" in name
+        r"^.*Sym.*",           # Any font with "Sym" in name
+        r"^LM[A-Z]*$",         # Latin Modern Math
+        r"^NimbusRom.*Ita",    # Nimbus Roman Italic (often used for math)
+    ]
+
+    # 컴파일된 폰트 패턴 (성능 최적화)
+    _compiled_font_patterns = None
+
+    @classmethod
+    def _get_font_patterns(cls):
+        """컴파일된 폰트 패턴 반환"""
+        if cls._compiled_font_patterns is None:
+            cls._compiled_font_patterns = [
+                re.compile(p, re.IGNORECASE) for p in cls.MATH_FONT_PATTERNS
+            ]
+        return cls._compiled_font_patterns
+
+    @classmethod
+    def is_math_font(cls, font_name: str) -> bool:
+        """폰트 이름이 수학 폰트인지 확인"""
+        if not font_name:
+            return False
+        for pattern in cls._get_font_patterns():
+            if pattern.search(font_name):
+                return True
+        return False
 
     # LaTeX 수식 패턴 (우선순위 순서)
     LATEX_PATTERNS = [
@@ -153,27 +195,48 @@ class FormulaDetector:
     SUBSCRIPT_SUPERSCRIPT = r'[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁱⁿ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₔₕₖₗₘₙₚₛₜ]+'
 
     @classmethod
-    def is_formula(cls, text: str) -> bool:
-        """텍스트가 수식인지 확인 (더 정밀한 감지)"""
+    def is_formula(cls, text: str, font_name: str = "", is_vertical: bool = False) -> bool:
+        """
+        텍스트가 수식인지 확인 (더 정밀한 감지)
+
+        Args:
+            text: 확인할 텍스트
+            font_name: 폰트 이름 (수학 폰트 감지용)
+            is_vertical: 수직 텍스트 여부
+
+        Returns:
+            수식이면 True
+        """
         text = text.strip()
         if not text:
             return False
 
-        # LaTeX 환경 체크
+        # 1. 폰트 기반 감지 (PDFMathTranslate 핵심 기능)
+        if font_name and cls.is_math_font(font_name):
+            return True
+
+        # 2. 수직 텍스트는 일반적으로 수식이 아님 (일본어/중국어 등)
+        # 하지만 단일 기호인 경우 수식일 수 있음
+        if is_vertical and len(text) > 1:
+            # 수직 텍스트가 수학 기호로만 구성된 경우만 수식으로 처리
+            if not re.search(cls.MATH_SYMBOLS, text) and not re.search(cls.GREEK_LETTERS, text):
+                return False
+
+        # 3. LaTeX 환경 체크
         for pattern in cls.LATEX_PATTERNS:
             if re.search(pattern, text, re.DOTALL):
                 return True
 
-        # LaTeX 명령어 체크
+        # 4. LaTeX 명령어 체크
         for pattern in cls.LATEX_COMMANDS:
             if re.search(pattern, text):
                 return True
 
-        # 수학 기호 체크
+        # 5. 수학 기호 체크
         if re.search(cls.MATH_SYMBOLS, text):
             return True
 
-        # Greek letters 체크
+        # 6. Greek letters 체크
         if re.search(cls.GREEK_LETTERS, text):
             # Greek letters만 있는 경우 수식으로 간주
             greek_count = len(re.findall(cls.GREEK_LETTERS, text))
@@ -181,11 +244,11 @@ class FormulaDetector:
             if greek_count > 0 and greek_count >= alpha_count * 0.3:
                 return True
 
-        # Subscript/superscript 체크
+        # 7. Subscript/superscript 체크
         if re.search(cls.SUBSCRIPT_SUPERSCRIPT, text):
             return True
 
-        # 수식 특성 분석: 숫자, 연산자, 변수의 조합
+        # 8. 수식 특성 분석: 숫자, 연산자, 변수의 조합
         operators = set('+-*/=<>≤≥≠≈∈∉⊂⊃')
         has_number = any(c.isdigit() for c in text)
         has_operator = any(c in operators for c in text)
@@ -195,7 +258,7 @@ class FormulaDetector:
             # 가능성 높은 수식 (예: "x + y = 5")
             return True
 
-        # 순수 숫자+연산자 조합
+        # 9. 순수 숫자+연산자 조합
         clean = re.sub(r'\s', '', text)
         if clean and all(c.isdigit() or c in '+-*/=.^_()[]{}' for c in clean):
             if len(clean) >= 3 and any(c in '+-*/=^_' for c in clean):
@@ -605,6 +668,20 @@ class PDFConverter:
                 x1 = max(s["bbox"][2] for s in line_spans)
                 y1 = max(s["bbox"][3] for s in line_spans)
 
+                # 수직 텍스트 감지 (PDFMathTranslate 참고)
+                # 텍스트 방향은 line의 dir 속성 또는 bbox의 비율로 판단
+                line_dir = line.get("dir", (1, 0))  # 기본값: 수평 (1, 0)
+                is_vertical = False
+                if line_dir:
+                    # dir[0]이 0에 가깝고 dir[1]이 1 또는 -1에 가까우면 수직
+                    if abs(line_dir[0]) < 0.5 and abs(line_dir[1]) > 0.5:
+                        is_vertical = True
+                # bbox 비율로도 체크 (높이가 너비보다 훨씬 큰 경우)
+                width = x1 - x0
+                height = y1 - y0
+                if width > 0 and height > width * 3 and len(line_text) > 3:
+                    is_vertical = True
+
                 # 가장 많은 텍스트를 커버하는 색상 찾기 (dominant color)
                 color_weights = {}  # color -> text_length
                 for span in line_spans:
@@ -634,7 +711,8 @@ class PDFConverter:
                     font_names[fn] = font_names.get(fn, 0) + text_len
                 font_name = max(font_names.keys(), key=lambda f: font_names[f]) if font_names else ""
 
-                is_formula = FormulaDetector.is_formula(line_text)
+                # 수식 감지 (폰트 이름과 수직 텍스트 여부 전달)
+                is_formula = FormulaDetector.is_formula(line_text, font_name, is_vertical)
 
                 blocks.append(TextBlock(
                     text=line_text,
@@ -643,6 +721,7 @@ class PDFConverter:
                     font_name=font_name,
                     color=dominant_color,
                     is_formula=is_formula,
+                    is_vertical=is_vertical,
                 ))
 
         return blocks
@@ -972,6 +1051,17 @@ class PDFConverter:
                 x1 = max(s["bbox"][2] for s in line_spans) * scale
                 y1 = max(s["bbox"][3] for s in line_spans) * scale
 
+                # 수직 텍스트 감지 (PDFMathTranslate 참고)
+                line_dir = line.get("dir", (1, 0))
+                is_vertical = False
+                if line_dir:
+                    if abs(line_dir[0]) < 0.5 and abs(line_dir[1]) > 0.5:
+                        is_vertical = True
+                width = x1 - x0
+                height = y1 - y0
+                if width > 0 and height > width * 3 and len(line_text) > 3:
+                    is_vertical = True
+
                 # 레이아웃 필터링
                 if layout_boxes:
                     if not self._is_in_translatable_region(
@@ -1008,7 +1098,8 @@ class PDFConverter:
                     font_names[fn] = font_names.get(fn, 0) + text_len
                 font_name = max(font_names.keys(), key=lambda f: font_names[f]) if font_names else ""
 
-                is_formula = FormulaDetector.is_formula(line_text)
+                # 수식 감지 (폰트 이름과 수직 텍스트 여부 전달)
+                is_formula = FormulaDetector.is_formula(line_text, font_name, is_vertical)
 
                 blocks.append(TextBlock(
                     text=line_text,
@@ -1017,6 +1108,7 @@ class PDFConverter:
                     font_name=font_name,
                     color=dominant_color,
                     is_formula=is_formula,
+                    is_vertical=is_vertical,
                 ))
 
         # OCR 폴백 (텍스트가 없는 스캔 PDF)
