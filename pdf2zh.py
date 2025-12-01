@@ -72,9 +72,40 @@ def main():
         try:
             from pdf2zh.gui import run_gui
             run_gui()
-        except ImportError:
-            print("GUI 실행 실패. CLI 모드를 사용하세요:")
+        except ImportError as e:
+            import traceback
+            print("=" * 60)
+            print("GUI 실행 실패!")
+            print("=" * 60)
+            print(f"\n오류 내용: {e}\n")
+
+            # PyQt5 설치 여부 확인
+            try:
+                import PyQt5
+                print("✓ PyQt5가 설치되어 있습니다.")
+            except ImportError:
+                print("✗ PyQt5가 설치되지 않았습니다.")
+                print("  설치 명령어: pip install PyQt5")
+
+            print("\n상세 오류:")
+            traceback.print_exc()
+            print("\n" + "=" * 60)
+            print("CLI 모드를 사용하세요:")
             print("  python pdf2zh.py --help")
+            print("=" * 60)
+            sys.exit(1)
+        except Exception as e:
+            import traceback
+            print("=" * 60)
+            print("GUI 실행 중 오류 발생!")
+            print("=" * 60)
+            print(f"\n오류 내용: {e}\n")
+            print("상세 오류:")
+            traceback.print_exc()
+            print("\n" + "=" * 60)
+            print("CLI 모드를 사용하세요:")
+            print("  python pdf2zh.py --help")
+            print("=" * 60)
             sys.exit(1)
     else:
         # CLI 모드
